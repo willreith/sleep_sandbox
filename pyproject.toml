@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=64", "setuptools-scm"]
+build-backend = "setuptools.backends.legacy:build"
+
+[project]
+name = "sleep_sandbox"
+version = "0.1.0"
+description = "Sandbox for neuropixels sleep stage preprocessing and analysis"
+requires-python = ">=3.10"
+
+dependencies = [
+    "spikewrap",          # brings spikeinterface with it
+    "numpy",
+    "scipy",
+    "matplotlib",
+    "pandas",
+    "jupyter",
+    "pyyaml",             # for loading configs
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest",
+    "black",
+    "ruff",
+    "ipykernel",
+]

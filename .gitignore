@@ -1,0 +1,38 @@
+# Data
+*.bin
+*.dat
+*.raw
+*.lf
+*.ap
+*.meta
+data/
+rawdata/
+derivatives/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+dist/
+build/
+.eggs/
+.env
+.venv/
+env/
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb_checkpoints
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+
+# Kilosort / sorter outputs
+*.npy
+*.mat
+sorting_output/
