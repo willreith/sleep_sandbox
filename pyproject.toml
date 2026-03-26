@@ -1,6 +1,6 @@
 [build-system]
-requires = ["setuptools>=64", "setuptools-scm"]
-build-backend = "setuptools.backends.legacy:build"
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
 
 [project]
 name = "sleep_sandbox"
@@ -17,6 +17,8 @@ dependencies = [
     "jupyter",
     "ipykernel",
     "pyyaml",             # for loading configs
+    "python-dotenv",
+    "spython",
 ]
 
 [project.optional-dependencies]
@@ -25,3 +27,7 @@ dev = [
     "black",
     "ruff",
 ]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["sleep_sandbox*"]
