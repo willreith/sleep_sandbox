@@ -8,6 +8,7 @@
 data/
 rawdata/
 derivatives/
+src/
 
 # Python
 __pycache__/
