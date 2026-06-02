@@ -1,0 +1,26 @@
+recording:
+  n_channels: 384
+  sample_rate: 30000
+  dtype: int16
+
+preprocessing:
+  phase_shift: {}
+  bandpass_filter:
+    freq_min: 300
+    freq_max: 5000
+  common_reference:
+    reference: global
+    operator: median
+
+sorting:
+  sorter: kilosort4
+  detect_threshold: 6
+
+lfp:
+  bandpass_filter:
+    freq_min: 0.5
+    freq_max: 300
+  common_reference:
+    reference: global
+    operator: median
+  resample_rate: 1000
