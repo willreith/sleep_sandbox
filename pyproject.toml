@@ -19,6 +19,7 @@ dependencies = [
     "pyyaml",             # for loading configs
     "python-dotenv",
     "spython",
+    "kilosort",
 ]
 
 [project.optional-dependencies]
