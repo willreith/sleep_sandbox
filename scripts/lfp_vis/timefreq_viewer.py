@@ -1,4 +1,4 @@
-"""Script for visualizing LFP traces"""
+"""Script for viewing time-frequency representations of LFP traces"""
 
 import os
 import ephyviewer
