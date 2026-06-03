@@ -7,4 +7,6 @@ dependencies:
   - av
   - ephyviewer
   - python-neo
+  - scipy
+  - python-dotenv
 prefix: /opt/homebrew/Caskroom/miniconda/base/envs/sleep_sandbox
