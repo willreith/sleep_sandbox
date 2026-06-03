@@ -8,7 +8,7 @@ from ephyviewer import mkQApp, MainViewer, TraceViewer
 
 load_dotenv()
 
-fpath = os.path.join(os.getenv("RAW_DATA_DIR"), os.getenv("TEST_DATA_FNAME"))
+fpath = os.path.join(os.getenv("RAW_DATA_DIR"), os.getenv("AWAKE_TEST_DATA_FNAME"))
 
 n_channels = 384
 dtype = np.int16
