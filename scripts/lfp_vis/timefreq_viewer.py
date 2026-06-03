@@ -55,7 +55,9 @@ view1.auto_scale()
 # Time-frequency representation
 view2 = TimeFreqViewer.from_numpy(sigs, target_rate, t_start=0., name='NP2 ProbeB TF')
 view2.params['display_labels'] = True
-view2.params['timefreq', 'deltafreq'] = 1
+view2.params['timefreq', 'f_start'] = 0.5
+view2.params['timefreq', 'f_stop'] = 200.
+view2.params['timefreq', 'deltafreq'] = 0.5
 
 win.add_view(view1)
 win.add_view(view2)
