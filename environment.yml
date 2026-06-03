@@ -9,4 +9,5 @@ dependencies:
   - python-neo
   - scipy
   - python-dotenv
+  - nbstripout
 prefix: /opt/homebrew/Caskroom/miniconda/base/envs/sleep_sandbox
