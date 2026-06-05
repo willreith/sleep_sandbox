@@ -37,3 +37,6 @@ Thumbs.db
 *.npy
 *.mat
 sorting_output/
+
+# Claude
+CLAUDE.md
