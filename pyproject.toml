@@ -20,6 +20,7 @@ dependencies = [
     "python-dotenv",
     "spython",
     "kilosort",
+    "streamlit",          # interactive ripple-explorer GUI
 ]
 
 [project.optional-dependencies]
