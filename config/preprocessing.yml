@@ -7,7 +7,7 @@ preprocessing:
   phase_shift: {}
   bandpass_filter:
     freq_min: 300
-    freq_max: 5000
+    freq_max: 6000
   common_reference:
     reference: global
     operator: median
@@ -18,7 +18,7 @@ sorting:
 
 lfp:
   bandpass_filter:
-    freq_min: 0.5
+    freq_min: 0.25
     freq_max: 300
   common_reference:
     reference: global
