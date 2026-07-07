@@ -111,3 +111,92 @@ def load_preprocessed(parent, stream):
             f"Multiple '{stream}' derivatives under {parent}: {[m.name for m in matches]}"
         )
     return si.load(matches[0])
+
+
+# --- BNO055 IMU streams ------------------------------------------------------
+# Per-stream .bin files, one per acquisition block (no embedded timestamps; timing is the Clock).
+# (dtype, n components per sample), inferred from file sizes + content.
+BNO055_CLOCK_HZ = 250e6   # free-running ONIX hardware counter
+_BNO055_STREAMS = {
+    "Clock":              ("<u8", 1),
+    "HubSyncCounter":     ("<u8", 1),
+    "Euler":              ("<f4", 3),
+    "Quaternion":         ("<f4", 4),
+    "GravityVector":      ("<f4", 3),
+    "LinearAcceleration": ("<f4", 3),
+}
+
+
+def load_bno055(data_dir, block, streams=None):
+    """Load BNO055 per-stream .bin files for one acquisition block; returns {name: array[-1, ncomp]}.
+
+    data_dir is the NeuropixelsV2 dir holding the raw .bin files. streams: None = all, or a subset
+    of _BNO055_STREAMS keys. All streams in one block share the same sample count."""
+    data_dir = Path(data_dir)
+    names = list(_BNO055_STREAMS) if streams is None else streams
+    out = {}
+    for name in names:
+        dtype, ncomp = _BNO055_STREAMS[name]
+        arr = np.fromfile(data_dir / f"NeuropixelsV2_Bno055_{name}_{block}.bin", dtype=dtype)
+        out[name] = arr.reshape(-1, ncomp)
+    return out
+
+
+def concat_bno055(data_dir, blocks=None, streams=("Clock", "LinearAcceleration", "Quaternion")):
+    """Concatenate BNO055 blocks in numeric order into continuous arrays + an abutted time axis.
+
+    blocks: None = all Clock blocks found under data_dir, else an explicit ordered list.
+    Returns (data, t, block_edges): data[name] stacked over blocks; t seconds, each block's Clock
+    duration abutted end-to-end (inter-block gaps dropped, mirroring the LFP concatenation);
+    block_edges is the start sample index of each block. Pure IO/assembly - no signal processing."""
+    data_dir = Path(data_dir)
+    if blocks is None:
+        blocks = sorted(int(re.search(r"_(\d+)\.bin$", p.name).group(1))
+                        for p in data_dir.glob("*Bno055_Clock_*.bin"))
+    parts = {name: [] for name in streams}
+    t_parts, block_edges, offset, n = [], [], 0.0, 0
+    for b in blocks:
+        blk = load_bno055(data_dir, b, streams)
+        clk = blk["Clock"].ravel().astype(np.float64)
+        tb = (clk - clk[0]) / BNO055_CLOCK_HZ
+        block_edges.append(n)
+        for name in streams:
+            parts[name].append(blk[name])
+        t_parts.append(tb + offset)
+        offset += tb[-1] + np.median(np.diff(tb))   # abut: block duration + one sample step
+        n += len(tb)
+    data = {name: np.concatenate(v, axis=0) for name, v in parts.items()}
+    return data, np.concatenate(t_parts), np.array(block_edges)
+
+
+def align_bno055_to_lfp(data_dir, blocks=None, probe="ProbeB", fs_raw=30000,
+                        streams=("Clock", "LinearAcceleration", "Quaternion")):
+    """Approach B: place BNO055 samples on the gap-removed LFP concat timeline via the shared clock.
+
+    Bno055_Clock_N and {probe}_Clock_N are the same free-running 250 MHz ONIX counter (one entry per
+    ephys sample). Each block's IMU clock span is mapped linearly onto its ephys segment's nominal
+    sample-time span (n_ephys / fs_raw seconds), and segments are abutted gap-free -- so inter-block
+    gaps the LFP concat dropped are excluded and the nominal-vs-true rate scale is corrected per
+    segment. Returns (data, t, valid, block_edges): t = concat time (s) per IMU sample; valid masks
+    samples inside their segment's clock span (edge samples falling in a gap are False)."""
+    data_dir = Path(data_dir)
+    if blocks is None:
+        blocks = sorted(int(re.search(r"_(\d+)\.bin$", p.name).group(1))
+                        for p in data_dir.glob("*Bno055_Clock_*.bin"))
+    parts = {name: [] for name in streams}
+    t_parts, valid_parts, block_edges, offset, n = [], [], [], 0.0, 0
+    for b in blocks:
+        pc = np.memmap(data_dir / f"NeuropixelsV2_{probe}_Clock_{b}.bin", dtype="<u8", mode="r")
+        start_c, end_c, n_eph = int(pc[0]), int(pc[-1]), len(pc)
+        scale = (n_eph / fs_raw) / (end_c - start_c)   # nominal seconds per clock count, this segment
+        blk = load_bno055(data_dir, b, streams)
+        c = blk["Clock"].ravel().astype(np.float64)
+        block_edges.append(n)
+        t_parts.append(offset + (c - start_c) * scale)
+        valid_parts.append((c >= start_c) & (c <= end_c))
+        for name in streams:
+            parts[name].append(blk[name])
+        offset += n_eph / fs_raw
+        n += len(c)
+    data = {name: np.concatenate(v, axis=0) for name, v in parts.items()}
+    return data, np.concatenate(t_parts), np.concatenate(valid_parts), np.array(block_edges)
