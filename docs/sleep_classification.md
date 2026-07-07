@@ -6,7 +6,7 @@
 - Slow wave power (0.5-1Hz) —— high = NREM
 - Delta/theta power ratio (1-4Hz vs 4-8Hz) —— high = NREM, low with no motion = REM
 - Spindle power (12-16Hz) —— high = NREM
-- Gamma —— ??
+- Gamma —— high = wake/REM
 
 **MUA**
 — Sharp ON/OFF states = NREM (corresponding to SWS)
@@ -26,6 +26,7 @@
 
 
 **Buzsaki strategy**
+
 Intracranial EMG
 - Bandpass (Butterworth, 4th order) filter in 300-600Hz range
 - Subselect pairs of random, good channels ≥ 2 shanks apart
@@ -39,17 +40,23 @@ Low-frequency spectral features
 5. Pick PC1. If negative loading on <20Hz frequencies, flip sign.
 6. Pick trough in bimodal distribution as threshold between NREM and Wake/REM.
 
+Narrowband theta (theta:delta ratio)
+- Shin et al. (2026) uses delta (1-4Hz) and theta (6-12Hz — quite high, should be closer to 4-8Hz to avoid contamination by spindle band).
+– Watson et al. (2016) uses 5-10Hz:2-16Hz.
+1. Bandpass filter for relevant frequency bands (4th order Butterworth filter).
+2. Pick channel with highest theta power.
+3. 
+
 ## Implementation notes & deviations from Watson et al.
 
 ### Channel selection
-- Starting with a single channel: **channel 73** (index into `recording_lfp`, on shank 3).
-- Note channel 73 was chosen for *high narrowband theta power*, not for slow waves, so it
-  is a convenience starting point for the broadband metric, not necessarily the best one.
-- Watson/buzcode `SleepScoreMaster` instead picks the channel whose broadband
-  slow-wave signal is *most bimodal*, scanning candidate channels. This is a multi-shank
-  Neuropixels 2.0 (ProbeA, 4-shank), so "best" means the most bimodal / most cortical
-  channel. **TODO:** revisit by scanning channels and choosing the cleanest bimodal
-  broadbandSlowWave histogram (step 5).
+- Channel is chosen automatically as the one with the **strongest bimodal split** in its
+  broadband slow-wave (PC1) score, scored with **Hartigan's dip test** (`diptest` package),
+  scanning every Nth channel (`channel_stride`). `manual_channel` overrides the automatic pick.
+- This follows buzcode `SleepScoreMaster`, which selects the most-bimodal channel. Scored on
+  the **no-CMR** LFP variant (see CMR note below).
+- The earlier default was a fixed channel 73 (theta-picked); it now survives only as a manual
+  override, not the default.
 
 ### Common median reference (CMR)
 - **CMR removed** for the LFP slow-wave metric.
@@ -61,12 +68,17 @@ Low-frequency spectral features
 
 ## Broadband LFP slow-wave metric — implementation approach
 
-Reference: Watson et al. 2016 / buzcode `SleepScoreLFP`. Status: steps 1–5 implemented in
-`notebooks/buzsaki_sleep_scoring.ipynb`.
+Reference: Watson et al. 2016 / buzcode `SleepScoreLFP`. Status: channel selection + steps
+1–5 implemented in `notebooks/buzsaki_sleep_scoring.ipynb`.
 
-**Input / prep.** One LFP channel at 1250 Hz. Currently **channel 73** (shank 3, a
-theta-picked convenience channel), on the **no-CMR** variant. See channel-selection and CMR
-caveats above.
+**Input / prep.** One LFP channel at 1250 Hz, on the **no-CMR** variant. The channel is chosen
+by Step 0 below (or `manual_channel`). See channel-selection and CMR caveats above.
+
+**Step 0 — Channel selection.** *(done)*
+- Scan every Nth channel (`channel_stride`); for each, run steps 1–4 and score the PC1
+  distribution's bimodality with **Hartigan's dip test** (`diptest`). Pick the max-dip channel.
+- Steps 1–4 are collapsed into a `broadband_pc1(trace, fs)` helper reused by the scan and by
+  the final run on the winning channel. `manual_channel` overrides the automatic pick.
 
 **Step 1 — Short-time FFT.** *(done)*
 - 10 s Hann window, 1 s step (~90% overlap) → power spectrogram.
