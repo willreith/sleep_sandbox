@@ -62,8 +62,9 @@ def pc1_threshold(pc1):
 
 # --- Narrowband theta --------------------------------------------------------
 THETA_BANDS = {
-    "watson": {"theta": (5, 10), "denom": (2, 16)},   # Watson et al. 2016: theta 5-10 / broadband 2-16 Hz
-    "shin":   {"theta": (6, 12), "denom": (1, 4)},    # Shin et al. 2026: theta 6-12 / delta 1-4 Hz
+    "watson":    {"theta": (5, 10), "denom": (2, 16)},   # Watson et al. 2016: theta 5-10 / broadband 2-16 Hz
+    "shin":      {"theta": (6, 12), "denom": (1, 4)},    # Shin et al. 2026: theta 6-12 / delta 1-4 Hz
+    "shin_mod":  {"theta": (5, 10), "denom": (1, 4)}     # Default: theta 5-10 / broadband 1-4 Hz
 }
 
 
