@@ -33,6 +33,7 @@ Intracranial EMG
 - Bandpass (Butterworth, 4th order) filter in 300-600Hz range
 - Subselect pairs of random, good channels ≥ 2 shanks apart
 - Take mean of Pearson's R in 500ms windows --> **this is the EMG score**
+- To implement later: 25Hz shoulder during bandpass (what does this mean?)
 
 Low-frequency spectral features
 1. Short-time FFT: 10s window, 1s step, evaluated at log-spaced frequencies between 1–100 Hz
@@ -57,6 +58,8 @@ to stay consistent with buzcode and the slow-wave metric):
    right-skewed, so log first) — and take the max-dip channel. This replaces "highest theta power",
    which can just pick the noisiest/highest-amplitude channel rather than the most theta-modulated.
 3. Ratio computed per convention in 10 s / 1 s windows on the chosen channel, aligned to `sw_times`.
+
+**Classification algorithm**
 
 ## Implementation notes & deviations from Watson et al.
 
