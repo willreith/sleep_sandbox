@@ -50,8 +50,45 @@ def select_channel_by_dip(rec, fs, stride=16, manual_channel=None):
     return best_channel, dip_stats, candidate_idx
 
 
-def pc1_threshold(pc1):
-    """Step 5: threshold between the two PC1 modes at the 2-component GMM posterior crossover."""
+def smooth_norm(x, step_s=1.0, win_s=15.0):
+    """buzcode metric prep before thresholding: centred moving average over win_s seconds, then
+    min-max to [0, 1]. Mirrors smooth(metric, smoothfact/specdt) (smoothfact=15) + bz_NormToRange
+    ([0 1]) in ClusterStates_GetMetrics. step_s is the metric bin width (1 s on the sw_times grid);
+    edges use a shrinking window (local mean), approximating MATLAB smooth."""
+    n = max(1, int(round(win_s / step_s)))
+    if n % 2 == 0:
+        n += 1                                            # MATLAB smooth uses an odd span
+    kernel = np.ones(n)
+    sm = np.convolve(x, kernel, mode="same") / np.convolve(np.ones_like(x), kernel, mode="same")
+    return (sm - sm.min()) / (sm.max() - sm.min())
+
+
+def bimodal_thresh(x, startbins=12, maxbins=25):
+    """buzcode bz_BimodalThresh: the coarsest histogram (bins from startbins up to maxbins) that
+    resolves two peaks, then the deepest trough between them; returns that bin centre, or NaN if no
+    two-peak split is found. Peaks are taken on the zero-padded histogram (so edge bins can be modes),
+    first two by location -- as in bz_BimodalThresh.m / the Motion branch. (The SW/theta inline copies
+    instead take the two tallest, findpeaks ...,'SortStr','descend'; kept simple here.)"""
+    for numbins in range(startbins, maxbins + 1):
+        hist, edges = np.histogram(x, bins=numbins)
+        peaks, _ = signal.find_peaks(np.concatenate(([0], hist, [0])))
+        peaks = peaks - 1                                 # undo left pad -> indices into hist
+        if len(peaks) >= 2:
+            lo, hi = peaks[0], peaks[1]
+            centers = (edges[:-1] + edges[1:]) / 2
+            return centers[lo + np.argmin(hist[lo:hi + 1])]   # deepest valley between the two modes
+    return np.nan
+
+
+def pc1_threshold(pc1, step_s=1.0):
+    """Step 5 (buzcode-concordant): between-mode threshold as the histogram trough of the 15 s-smoothed,
+    [0, 1]-normalised PC1. NOTE the threshold is in smoothed/normalised units -- compare it against
+    smooth_norm(pc1), not raw pc1. See pc1_threshold_gmm for the earlier GMM variant."""
+    return bimodal_thresh(smooth_norm(pc1, step_s))
+
+
+def pc1_threshold_gmm(pc1):
+    """Earlier variant (non-buzcode): threshold at the 2-component GMM posterior crossover."""
     gmm = GaussianMixture(n_components=2, random_state=0).fit(pc1.reshape(-1, 1))
     hi_comp = np.argsort(gmm.means_.ravel())[1]            # higher-mean component = NREM
     lo_mean, hi_mean = np.sort(gmm.means_.ravel())
@@ -95,6 +132,36 @@ def select_theta_channel(rec, fs, convention, stride=16, manual_channel=None):
         dip_stats[ci] = diptest(np.log10(theta_ratio(spec, freqs, convention)))[0]
     best = manual_channel if manual_channel is not None else int(np.nanargmax(dip_stats))
     return best, dip_stats, candidate_idx
+
+
+def select_theta_channel_peak(rec, fs, theta=(5, 10), denom=(2, 20), stride=16, manual_channel=None):
+    """buzcode PickSWTHChannel theta pick (the actual buzcode default): the channel with the highest
+    mean theta-band power ratio, NOT the most bimodal. Mirrors peakTH =
+    sum(meanspec(thfreqs))/sum(meanspec(:)) -- theta 5-10 Hz over broadband 2-20 Hz on the time-mean
+    spectrum. (Contrast select_theta_channel, which picks max dip -- a deliberate deviation.)"""
+    n_ch = rec.get_num_channels()
+    candidate_idx = np.arange(0, n_ch, stride)
+    peak_stats = np.full(n_ch, np.nan)
+    for ci in candidate_idx:
+        trace = rec.get_traces(channel_ids=[rec.channel_ids[ci]]).squeeze()
+        spec, freqs, _ = log_spectrogram(trace, fs)
+        peak_stats[ci] = band_power(spec, freqs, theta).mean() / band_power(spec, freqs, denom).mean()
+    best = manual_channel if manual_channel is not None else int(np.nanargmax(peak_stats))
+    return best, peak_stats, candidate_idx
+
+
+def conditioned_theta_thresh(theta_metric, sw_metric, motion_metric, sw_thresh, motion_thresh,
+                             startbins=12, maxbins=25):
+    """buzcode movement-conditioned theta threshold (ClusterStates_GetMetrics): the theta trough is
+    taken only on non-moving epochs. MOVtimes = low SW & high motion; the theta dip is found on
+    ~MOVtimes, and if that isn't bimodal, retried also excluding NREM (~NREMtimes & ~MOVtimes).
+    All inputs are the smoothed/[0,1] metrics on the same grid. Returns (th_thresh, movtimes)."""
+    nrem = sw_metric > sw_thresh
+    mov = (sw_metric < sw_thresh) & (motion_metric > motion_thresh)
+    th = bimodal_thresh(theta_metric[~mov], startbins, maxbins)
+    if np.isnan(th):
+        th = bimodal_thresh(theta_metric[~nrem & ~mov], startbins, maxbins)
+    return th, mov
 
 
 # --- Small reductions --------------------------------------------------------
