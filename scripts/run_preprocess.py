@@ -32,22 +32,26 @@ session_dir = data_dir.parent                 # datetime dir holding the probe c
 base_dir    = Path(os.environ["PREPRO_OUTPUT_DIR"])
 suffixes    = range(5, 8)                  # 48 segments (~8.1 h)
 
-margin_ms     = 12000                          # 0.25 Hz high-pass settles over seconds
-emg_margin_ms = 100                            # 300-600 Hz band settles in ms
 n_jobs        = 4        # per-worker peak is large (30s chunk + 24s margin, float32, + resample buffers)
 chunk         = "30s"
 
 with open(repo_root / "config/preprocessing.yml") as f:
     config = yaml.safe_load(f)
 
-sample_rate   = config['recording']['sample_rate']
-n_channels    = config['recording']['n_channels']
-dtype         = config['recording']['dtype']
-freq_min      = config['lfp']['bandpass_filter']['freq_min']
-freq_max      = config['lfp']['bandpass_filter']['freq_max']
-reference     = config['lfp']['common_reference']['reference']
-operator      = config['lfp']['common_reference']['operator']
-resample_rate = config['lfp']['resample_rate']
+sample_rate       = config['recording']['sample_rate']
+n_channels        = config['recording']['n_channels']
+dtype             = config['recording']['dtype']
+freq_min          = config['lfp']['bandpass_filter']['freq_min']
+freq_max          = config['lfp']['bandpass_filter']['freq_max']
+margin_ms         = config['lfp']['margin_ms']              # 0.25 Hz high-pass settles over seconds
+reference         = config['lfp']['common_reference']['reference']
+operator          = config['lfp']['common_reference']['operator']
+resample_rate     = config['lfp']['resample_rate']
+
+emg_freq_min      = config['emg']['bandpass_filter']['freq_min']
+emg_freq_max      = config['emg']['bandpass_filter']['freq_max']
+emg_margin_ms     = config['emg']['margin_ms']               # 300-600 Hz band settles in ms
+emg_resample_rate = config['emg']['resample_rate']
 
 # ---------------------------------------------------------------------------
 # Discover + concatenate the selected segments
@@ -81,7 +85,7 @@ rec_cmr, cmr_steps = build_band(
     recording, freq_min, freq_max, resample_rate, margin_ms,
     cmr=True, reference=reference, operator=operator, source_steps=[concat_step])
 rec_emg, emg_steps = build_band(
-    recording, 300, 600, resample_rate, emg_margin_ms, source_steps=[concat_step])
+    recording, emg_freq_min, emg_freq_max, emg_resample_rate, emg_margin_ms, source_steps=[concat_step])
 
 builds = [
     ("lfp_nocmr", rec_nocmr, nocmr_steps),
