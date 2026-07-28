@@ -20,7 +20,15 @@ lfp:
   bandpass_filter:
     freq_min: 0.25
     freq_max: 300
+  margin_ms: 12000
   common_reference:
     reference: global
     operator: median
+  resample_rate: 1250
+
+emg:
+  bandpass_filter:
+    freq_min: 300
+    freq_max: 600
+  margin_ms: 100
   resample_rate: 1250
