@@ -30,14 +30,16 @@ theta:
     shin:     {theta: [6, 12], denom: [1, 4]}     # Shin et al. 2026
     shin_mod: {theta: [5, 10], denom: [1, 4]}     # local default
   concordant_convention: watson    # convention used for the buzcode-order concordant theta threshold
+  report_conventions: [watson, shin, shin_mod]   # extra conventions to also report (theta_metric_<name>);
+                                   # override per-call via score_recording's theta_conventions arg
   channel_peak_band:                # buzcode PickSWTHChannel band -- channel selection only, distinct
     theta: [5, 10]                  # from the ratio conventions above (denom differs: 2-20 vs 2-16)
     denom: [2, 20]
 
 emg:                                # intracranial EMG proxy (cross-shank high-frequency coherence)
-  n_pairs: 100                      # random channel pairs, spread round-robin across qualifying shank combos
+  n_pairs: 50                      # random channel pairs, spread round-robin across qualifying shank combos
   min_shank_dist: 2                 # minimum shank separation between paired channels
-  window_s: 0.5                     # non-overlapping window for the Pearson r score
+  window_s: 1.0                     # non-overlapping window for the Pearson r score
   seed: 0
 
 imu:
