@@ -237,3 +237,15 @@ def bin_max(t, x, grid):
     np.maximum.at(out, idx, x)
     out[np.isneginf(out)] = np.nan                             # bins with no sample
     return out
+
+
+def bin_var(t, x, grid):
+    """Per-grid-bin variance of x (buzcode 'data_var' analogue for accelerometer motion); NaN for
+    empty bins. Nearest-bin assignment, like bin_max (but no out-of-range drop -- callers pass
+    already-valid samples)."""
+    idx = np.searchsorted(grid, t).clip(0, len(grid) - 1)
+    c = np.bincount(idx, minlength=len(grid)).astype(float)
+    s = np.bincount(idx, weights=x, minlength=len(grid))
+    s2 = np.bincount(idx, weights=x * x, minlength=len(grid))
+    c[c == 0] = np.nan
+    return s2 / c - (s / c) ** 2
