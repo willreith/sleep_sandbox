@@ -11,9 +11,9 @@ import yaml
 import matplotlib.pyplot as plt
 
 from sleep_sandbox.analysis import (
-    broadband_pc1, select_channel_by_dip, select_theta_channel_peak, log_spectrogram,
-    smooth_norm, bimodal_thresh, theta_ratio, conditioned_theta_thresh, bin_max, zscore,
-    make_emg_pairs, emg_from_lfp,
+    broadband_pc1, select_channel_by_dip, select_theta_channel, select_theta_channel_peak,
+    log_spectrogram, smooth_norm, bimodal_thresh, theta_ratio, conditioned_theta_thresh,
+    bin_max, bin_var, zscore, make_emg_pairs, emg_from_lfp,
 )
 
 CORE_METRICS = ("sw_metric", "theta_metric", "motion_metric", "imu_speed")
@@ -254,3 +254,237 @@ def save_run(result, scoring_config, out_path, source_dirs):
     sidecar = {"scoring_config": scoring_config, "result_scalars": scalars, "sources": sources}
     with open(out_path.with_suffix(".yml"), "w") as f:
         yaml.safe_dump(sidecar, f, sort_keys=False)
+
+
+def notebook_extras(recording_lfp, recording_emg, scoring_config, times,
+                     imu_t, imu_valid, imu_ang, imu_accel, result, cache_path=None, conventions=None):
+    """Recompute the raw/per-convention signals behind the notebook-style diagnostic plots that
+    score_recording's persisted result doesn't keep: the spectrogram on result['sw_channel'], each
+    theta convention's own dip-selected channel + raw ratio (buzcode-style per-convention channel
+    scan -- distinct from score_recording's shared peakTH channel), raw EMG score before smoothing,
+    and IMU angular speed / |accel| / accel-variance binned onto `times`. If cache_path is given
+    and already exists, loads and returns it instead of recomputing; otherwise computes and (if
+    cache_path is given) saves it there for next time. conventions: THETA_BANDS names to scan
+    (default: scoring_config's theta.conventions keys)."""
+    cache_path = Path(cache_path) if cache_path is not None else None
+    if cache_path is not None and cache_path.exists():
+        with np.load(cache_path) as d:
+            return {k: d[k] for k in d.files}
+
+    fs = recording_lfp.get_sampling_frequency()
+    spec_cfg = scoring_config["spectrogram"]
+    spectrogram_kwargs = dict(window_s=spec_cfg["window_s"], step_s=spec_cfg["step_s"],
+                              freq_min=spec_cfg["freq_min"], freq_max=spec_cfg["freq_max"],
+                              n_freq_bins=spec_cfg["n_freq_bins"])
+    channel_stride = scoring_config["channel_selection"]["stride"]
+    conventions = conventions or list(scoring_config["theta"]["conventions"])
+
+    print("  [notebook_extras] spectrogram on sw_channel...", flush=True)
+    sw_trace = recording_lfp.get_traces(
+        channel_ids=[recording_lfp.channel_ids[int(result["sw_channel"])]]).squeeze()
+    sw_spec, sw_freqs, _ = log_spectrogram(sw_trace, fs, **spectrogram_kwargs)
+
+    theta_own_channel, theta_own_ratio = {}, {}
+    for conv in conventions:
+        print(f"  [notebook_extras] theta channel scan ({conv})...", flush=True)
+        ch, _, _ = select_theta_channel(recording_lfp, fs, conv, channel_stride, **spectrogram_kwargs)
+        trace = recording_lfp.get_traces(channel_ids=[recording_lfp.channel_ids[ch]]).squeeze()
+        spec, freqs, _ = log_spectrogram(trace, fs, **spectrogram_kwargs)
+        theta_own_channel[conv] = ch
+        theta_own_ratio[conv] = theta_ratio(spec, freqs, conv)
+
+    print("  [notebook_extras] raw EMG score...", flush=True)
+    emg_cfg = scoring_config["emg"]
+    emg_shanks = recording_emg.get_probes()[0].shank_ids.astype(int)
+    emg_pairs, _ = make_emg_pairs(
+        emg_shanks, n_pairs=emg_cfg["n_pairs"], min_shank_dist=emg_cfg["min_shank_dist"], seed=emg_cfg["seed"])
+    emg_score, emg_times = emg_from_lfp(recording_emg, emg_pairs, win_s=emg_cfg["window_s"])
+    emg_b = np.interp(times, emg_times, emg_score)
+
+    print("  [notebook_extras] IMU angular speed / |accel| / accel-variance...", flush=True)
+    tv = imu_t[imu_valid]
+    imu_ang_b = bin_max(tv, imu_ang[imu_valid], times)
+    imu_accel_b = bin_max(tv, imu_accel[imu_valid], times)
+    imu_accel_var_b = bin_var(tv, imu_accel[imu_valid], times)
+
+    extras = {
+        "sw_spec": sw_spec, "sw_freqs": sw_freqs,
+        "emg_b": emg_b, "imu_ang_b": imu_ang_b, "imu_accel_b": imu_accel_b,
+        "imu_accel_var_b": imu_accel_var_b,
+        **{f"theta_own_channel_{c}": theta_own_channel[c] for c in conventions},
+        **{f"theta_own_ratio_{c}": theta_own_ratio[c] for c in conventions},
+    }
+    if cache_path is not None:
+        np.savez(cache_path, **extras)
+    print("  [notebook_extras] done.", flush=True)
+    return extras
+
+
+def _pick_window(sw_metric, sw_thresh, dt, target_s=480.0, max_s=600.0):
+    """Shortest centred window (target_s, growing up to max_s) around a NREM<->non-NREM
+    transition that contains both above- and below-threshold epochs, for the Figure-1 overview
+    plot. Falls back to the first target_s samples if sw_metric never crosses sw_thresh."""
+    state = sw_metric > sw_thresh
+    transitions = np.flatnonzero(np.diff(state.astype(int)) != 0)
+    if len(transitions) == 0:
+        return 0, min(len(sw_metric), int(round(target_s / dt)))
+    mid = transitions[len(transitions) // 2]
+    half = int(round(target_s / dt / 2))
+    lo, hi = max(0, mid - half), min(len(sw_metric), mid + half)
+    while state[lo:hi].mean() in (0.0, 1.0) and (hi - lo) * dt < max_s:
+        half += int(round(30.0 / dt))
+        lo, hi = max(0, mid - half), min(len(sw_metric), mid + half)
+    return lo, hi
+
+
+def plot_notebook_figures(result, extras, scoring_config, out_dir=None):
+    """The notebook-style diagnostic figures (buzsaki_sleep_scoring.ipynb cells 18/19/29/30/34/42/
+    53-54, plus a movement-conditioning comparison across all theta conventions extending cell 51):
+    spectrogram, slow-wave metric + threshold, theta-convention comparison, Shin theta vs PC1,
+    a Figure-1-style session overview, EMG vs slow-wave metric vs IMU speed, motion-candidate
+    distributions, and per-convention movement-conditioned theta thresholds. result: score_recording
+    output (or the loaded result.npz + result.yml scalars, merged). extras: notebook_extras output.
+    Saves PNGs into out_dir if given (else returns the figures)."""
+    times = result["times"]
+    step_s = scoring_config["spectrogram"]["step_s"]
+    smooth_win_s = scoring_config["smoothing"]["window_s"]
+    bt_startbins = scoring_config["bimodal_threshold"]["startbins"]
+    bt_maxbins = scoring_config["bimodal_threshold"]["maxbins"]
+    conventions = list(scoring_config["theta"]["conventions"])
+    sw_channel = int(result["sw_channel"])
+    sw_thresh = float(result["sw_thresh"])
+    motion_thresh = float(result["motion_thresh"])
+    figs = {}
+
+    # Plot spectrogram of the selected channel.
+    fig, ax = plt.subplots(figsize=(10, 4), dpi=150)
+    pcm = ax.pcolormesh(times, extras["sw_freqs"], np.log10(extras["sw_spec"]), shading="auto", cmap="viridis")
+    ax.set_yscale("log")
+    ax.set_xlabel("Time (s)"); ax.set_ylabel("Frequency (Hz)")
+    ax.set_title(f"Spectrogram (sw_channel={sw_channel})")
+    fig.colorbar(pcm, ax=ax, label="log10 power")
+    figs["spectrogram"] = fig
+
+    # Plot the buzcode-concordant slow-wave metric (15 s-smoothed, [0,1]) over time with its threshold.
+    fig, ax = plt.subplots(figsize=(10, 3), dpi=150)
+    ax.plot(times, result["sw_metric"], lw=0.5)
+    ax.axhline(sw_thresh, color="r", ls="--", label=f"threshold = {sw_thresh:.3f}")
+    ax.set_xlabel("Time (s)"); ax.set_ylabel("slow-wave metric (smoothed, [0,1])")
+    ax.set_title(f"Slow-wave metric (ch{sw_channel})")
+    ax.legend()
+    figs["sw_metric"] = fig
+
+    # Compare the two conventions: z-scored log-ratio over time, and against each other.
+    z_watson = zscore(np.log10(extras["theta_own_ratio_watson"]))
+    z_shin = zscore(np.log10(extras["theta_own_ratio_shin"]))
+    fig, (ax_ts, ax_sc) = plt.subplots(1, 2, figsize=(13, 3), dpi=150, gridspec_kw={"width_ratios": [3, 1]})
+    ax_ts.plot(times, z_watson, lw=0.5, label=f"watson (ch {int(extras['theta_own_channel_watson'])})")
+    ax_ts.plot(times, z_shin, lw=0.5, label=f"shin (ch {int(extras['theta_own_channel_shin'])})")
+    ax_ts.set_xlabel("Time (s)"); ax_ts.set_ylabel("z-scored log theta ratio"); ax_ts.legend()
+    ax_sc.scatter(z_watson, z_shin, s=2, alpha=0.3)
+    r = np.corrcoef(z_watson, z_shin)[0, 1]
+    ax_sc.set_xlabel("watson"); ax_sc.set_ylabel("shin"); ax_sc.set_title(f"r = {r:.3f}")
+    fig.tight_layout()
+    figs["theta_conventions"] = fig
+
+    # Shin theta measure vs slow-wave PC1 (both z-scored for the overlay; same 10 s / 1 s time base).
+    z_shin = zscore(np.log10(extras["theta_own_ratio_shin"]))
+    z_sw = zscore(result["sw_pc1"])
+    fig, (ax_sc, ax_ts) = plt.subplots(1, 2, figsize=(13, 3.5), dpi=150, gridspec_kw={"width_ratios": [1, 3]})
+    ax_sc.scatter(z_sw, z_shin, s=2, alpha=0.3)
+    r = np.corrcoef(z_sw, z_shin)[0, 1]
+    ax_sc.set_xlabel("slow-wave PC1 (z)"); ax_sc.set_ylabel("shin theta (z)"); ax_sc.set_title(f"r = {r:.3f}")
+    ax_ts.plot(times, z_sw, lw=0.5, label="slow-wave PC1")
+    ax_ts.plot(times, z_shin, lw=0.5, label=f"Shin theta (ch {int(extras['theta_own_channel_shin'])})")
+    ax_ts.set_xlabel("Time (s)"); ax_ts.set_ylabel("z-score"); ax_ts.legend()
+    fig.tight_layout()
+    figs["shin_vs_pc1"] = fig
+
+    # Figure 1: PC1, Shin theta, and IMU movement over the session (shared 1 s time base).
+    # NB: uses sw_metric (not raw sw_pc1) in panel 0 so sw_thresh -- a smoothed/[0,1] threshold --
+    # is in the same units as what's plotted (the notebook's cell 34 overlays it on raw PC1, a
+    # unit mismatch flagged in analysis.py's pc1_threshold docstring).
+    dt = float(np.median(np.diff(times)))
+    lo, hi = _pick_window(result["sw_metric"], sw_thresh, dt)
+    sl = slice(lo, hi)
+    t = times[sl]
+    fig, ax = plt.subplots(5, 1, sharex=True, figsize=(12, 9), dpi=150)
+    ax[0].plot(t, result["sw_metric"][sl], lw=0.5)
+    ax[0].axhline(sw_thresh, color="r", ls="--")
+    ax[0].set_ylabel("slow-wave metric [0,1]")
+    ax[1].plot(t, z_shin[sl], lw=0.5, color="C1")
+    ax[1].set_ylabel("shin theta (z)")
+    ax[2].plot(t, result["imu_speed"][sl], lw=0.5, color="C2")
+    ax[2].set_ylabel("speed (m/s)")
+    ax[3].plot(t, extras["imu_ang_b"][sl], lw=0.5, color="C3")
+    ax[3].set_ylabel("ang. speed (deg/s)")
+    ax[4].plot(t, extras["imu_accel_b"][sl], lw=0.5, color="C4")
+    ax[4].set_ylabel("|accel| (m/s²)")
+    ax[4].set_xlabel("Time (s)")
+    fig.tight_layout()
+    figs["figure1_overview"] = fig
+
+    # EMG score vs slow-wave metric and IMU speed over the session (shared 1 s grid).
+    z_emg = zscore(extras["emg_b"])
+    fig, ax = plt.subplots(3, 1, sharex=True, figsize=(12, 6), dpi=150)
+    ax[0].plot(times, z_emg, lw=0.4); ax[0].set_ylabel("EMG (z)")
+    ax[1].plot(times, result["sw_metric"], lw=0.4, color="C0")
+    ax[1].axhline(sw_thresh, color="r", ls="--")
+    ax[1].set_ylabel("slow-wave metric [0,1]")
+    ax[2].plot(times, result["imu_speed"], lw=0.4, color="C2")
+    ax[2].set_ylabel("speed (m/s)"); ax[2].set_xlabel("Time (s)")
+    fig.suptitle(f"EMG vs slow-wave metric and IMU speed (sw_ch={sw_channel})")
+    fig.tight_layout()
+    figs["emg_vs_metrics"] = fig
+
+    # Normalised motion distributions with their trough thresholds (MOV frac + conditioned THthresh per title).
+    motion_candidates = {
+        "EMG (tone)": extras["emg_b"],
+        "IMU speed": np.nan_to_num(result["imu_speed"], nan=0.0),
+        "IMU |accel|": np.nan_to_num(extras["imu_accel_b"], nan=0.0),
+        "IMU angular": np.nan_to_num(extras["imu_ang_b"], nan=0.0),
+        "IMU accel-var": np.nan_to_num(extras["imu_accel_var_b"], nan=0.0),
+    }
+    motion_metrics = {}
+    for name, sig in motion_candidates.items():
+        m = smooth_norm(sig, step_s=step_s, win_s=smooth_win_s)
+        mt = bimodal_thresh(m, bt_startbins, bt_maxbins)
+        tht, mov = conditioned_theta_thresh(
+            result["theta_metric"], result["sw_metric"], m, sw_thresh, mt, bt_startbins, bt_maxbins)
+        motion_metrics[name] = (m, mt, mov, tht)
+    fig, ax = plt.subplots(1, len(motion_metrics), figsize=(16, 3.2), dpi=150, sharey=True)
+    for a, (name, (m, mt, mov, tht)) in zip(ax, motion_metrics.items()):
+        a.hist(m, bins=50, density=True, alpha=0.5)
+        a.axvline(mt, color="r", ls="--")
+        a.set_title(f"{name}\nMOV={mov.mean():.2f}, THcond={tht:.3f}")
+        a.set_xlabel("motion metric [0,1]")
+    ax[0].set_ylabel("density")
+    fig.tight_layout()
+    figs["motion_distributions"] = fig
+
+    # Effect of movement-conditioning on the theta threshold, extended across all theta conventions
+    # (each on its own dip-selected channel), plus the motion (EMG) split.
+    mov = result["mov"].astype(bool)
+    fig, ax = plt.subplots(1, len(conventions) + 1, figsize=(4 * (len(conventions) + 1), 3.6), dpi=150)
+    for i, conv in enumerate(conventions):
+        tm = smooth_norm(extras[f"theta_own_ratio_{conv}"], step_s=step_s, win_s=smooth_win_s)
+        tht, _ = conditioned_theta_thresh(
+            tm, result["sw_metric"], result["motion_metric"], sw_thresh, motion_thresh, bt_startbins, bt_maxbins)
+        ax[i].hist(tm, bins=50, density=True, alpha=0.4, label="all epochs")
+        ax[i].hist(tm[~mov], bins=50, density=True, alpha=0.4, label="non-moving")
+        ax[i].axvline(tht, color="r", ls="--", label=f"THthresh={tht:.3f}")
+        ax[i].set_xlabel(f"{conv} theta metric [0,1]"); ax[i].legend()
+    ax[0].set_ylabel("density")
+    ax[-1].hist(result["motion_metric"], bins=50, density=True, alpha=0.5)
+    ax[-1].axvline(motion_thresh, color="r", ls="--", label=f"MotionThresh={motion_thresh:.3f}")
+    ax[-1].set_xlabel("motion metric (EMG) [0,1]"); ax[-1].legend()
+    fig.tight_layout()
+    figs["theta_movement_conditioning"] = fig
+
+    if out_dir is not None:
+        out_dir = Path(out_dir)
+        out_dir.mkdir(parents=True, exist_ok=True)
+        for name, fig in figs.items():
+            fig.savefig(out_dir / f"{name}.png", dpi=150)
+        return None
+    return figs
