@@ -49,9 +49,9 @@ def select_channel_by_dip(rec, fs, stride=16, manual_channel=None, **pc1_kwargs)
     n_ch = rec.get_num_channels()
     candidate_idx = np.arange(0, n_ch, stride)
     dip_stats = np.full(n_ch, np.nan)
-    for ci in candidate_idx:
-        trace = rec.get_traces(channel_ids=[rec.channel_ids[ci]]).squeeze()
-        dip_stats[ci] = diptest(broadband_pc1(trace, fs, **pc1_kwargs)[0])[0]
+    traces = rec.get_traces(channel_ids=rec.channel_ids[candidate_idx])  # one pass over the file
+    for j, ci in enumerate(candidate_idx):
+        dip_stats[ci] = diptest(broadband_pc1(traces[:, j], fs, **pc1_kwargs)[0])[0]
     best_channel = manual_channel if manual_channel is not None else int(np.nanargmax(dip_stats))
     return best_channel, dip_stats, candidate_idx
 
@@ -151,9 +151,9 @@ def select_theta_channel_peak(rec, fs, theta=(5, 10), denom=(2, 20), stride=16, 
     n_ch = rec.get_num_channels()
     candidate_idx = np.arange(0, n_ch, stride)
     peak_stats = np.full(n_ch, np.nan)
-    for ci in candidate_idx:
-        trace = rec.get_traces(channel_ids=[rec.channel_ids[ci]]).squeeze()
-        spec, freqs, _ = log_spectrogram(trace, fs, **spectrogram_kwargs)
+    traces = rec.get_traces(channel_ids=rec.channel_ids[candidate_idx])  # one pass over the file
+    for j, ci in enumerate(candidate_idx):
+        spec, freqs, _ = log_spectrogram(traces[:, j], fs, **spectrogram_kwargs)
         peak_stats[ci] = band_power(spec, freqs, theta).mean() / band_power(spec, freqs, denom).mean()
     best = manual_channel if manual_channel is not None else int(np.nanargmax(peak_stats))
     return best, peak_stats, candidate_idx
@@ -171,6 +171,55 @@ def conditioned_theta_thresh(theta_metric, sw_metric, motion_metric, sw_thresh, 
     if np.isnan(th):
         th = bimodal_thresh(theta_metric[~nrem & ~mov], startbins, maxbins)
     return th, mov
+
+
+# --- Intracranial EMG proxy ---------------------------------------------------
+def make_emg_pairs(shank_ids, n_pairs=100, min_shank_dist=2, seed=0):
+    """n_pairs random channel pairs whose shanks are >= min_shank_dist apart. Pairs are spread
+    round-robin across every qualifying shank-combo, drawing distinct channels (a shank's pool is
+    reshuffled + refilled only once exhausted) so as many electrodes as possible are covered."""
+    rng = np.random.default_rng(seed)
+    shanks = np.asarray(shank_ids, dtype=int)
+    uniq = np.unique(shanks)
+    ch_by_shank = {s: np.where(shanks == s)[0] for s in uniq}
+    combos = [(a, b) for i, a in enumerate(uniq) for b in uniq[i + 1:] if b - a >= min_shank_dist]
+    queues = {s: [] for s in uniq}
+    def draw(s):
+        if not queues[s]:
+            queues[s] = list(rng.permutation(ch_by_shank[s]))
+        return int(queues[s].pop())
+    pairs = np.array([draw(s) for k in range(n_pairs) for s in combos[k % len(combos)]]).reshape(-1, 2)
+    return pairs, combos
+
+
+def emg_from_lfp(rec, pairs, win_s=0.5, chunk_s=600):
+    """Watson EMG score: mean per-window Pearson r across channel pairs, on non-overlapping win_s
+    windows of the raw 300-600 Hz trace. Returns (emg, times) at the window rate (1/win_s).
+    chunk_s: seconds of data held in memory at a time, bounding peak memory to
+    chunk_s * n_channels_used regardless of total recording length."""
+    fs = rec.get_sampling_frequency()
+    win = int(round(win_s * fs))
+    n_win = rec.get_num_frames() // win
+    ch_ids = rec.channel_ids
+    used = np.unique(pairs)
+    col = {c: j for j, c in enumerate(used)}
+
+    win_per_chunk = max(1, int(chunk_s / win_s))
+    r = np.zeros(n_win)
+    for start_win in range(0, n_win, win_per_chunk):
+        end_win = min(start_win + win_per_chunk, n_win)
+        traces = rec.get_traces(channel_ids=ch_ids[used],
+                                 start_frame=start_win * win, end_frame=end_win * win).astype(np.float32)
+        n_w = end_win - start_win
+        for a, b in pairs:
+            A = traces[:, col[a]].reshape(n_w, win)
+            B = traces[:, col[b]].reshape(n_w, win)
+            A = A - A.mean(1, keepdims=True)
+            B = B - B.mean(1, keepdims=True)
+            r[start_win:end_win] += (A * B).sum(1) / np.sqrt((A ** 2).sum(1) * (B ** 2).sum(1))
+    emg = r / len(pairs)
+    times = (np.arange(n_win) * win + win / 2) / fs
+    return emg, times
 
 
 # --- Small reductions --------------------------------------------------------
