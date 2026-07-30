@@ -87,6 +87,22 @@ to stay consistent with buzcode and the slow-wave metric):
   binning. This is purely cosmetic; see `io_and_processing.md` §2b.
 - Binning maps each IMU sample to the nearest slow wave PC bin (10 s STFT windows → 10 s smoothing).
 
+**Current status: diagnostic-only.** IMU feeds `imu_wake_xcorr` (a QC cross-correlation against
+the wake proxy) and is reported alongside the core metrics, but is not an input to any threshold
+in `score_recording` -- `sw_thresh`/`motion_thresh`/`th_thresh` are all computed from LFP/EMG only.
+Whether IMU (or some derivative of it) should ever gate a classification threshold, vs. remain
+permanently QC-only, is an open question, not yet decided.
+
+Substituting IMU for EMG as the motion input is under active consideration but has **no buzcode
+precedent** to lean on: checked across all buzcode branches, `SleepScoreMaster`'s
+`MotionSource='Accelerometer'` path (`bz_GetAccelerometerMotion.m`) is unimplemented everywhere,
+and the one real accelerometer-extraction function that does exist (`bz_getIntanAccel.m`, `RHdev`
+branch only) was never wired into a thresholding pipeline. See `ANALYSIS_FRAMEWORK.md` for the
+full research writeup. The mechanistic concern: EMG reflects muscle tone, and REM is defined by
+atonia, which IMU-derived movement/acceleration signals cannot straightforwardly detect (a still
+animal in quiet wake looks the same to an IMU as one in REM atonia). Any IMU-based substitute
+needs direct empirical validation against the EMG-based `rem` mask, not adoption by analogy.
+
 ## Broadband LFP slow-wave metric — implementation approach
 
 Reference: Watson et al. 2016 / buzcode `SleepScoreLFP`. 
