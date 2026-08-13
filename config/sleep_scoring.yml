@@ -20,15 +20,40 @@ slow_wave:                         # broadband PC1 (steps 1-4, Watson et al.)
 smoothing:
   window_s: 15.0                   # centred moving average applied before [0,1]-normalising a metric
 
-bimodal_threshold:                 # buzcode bz_BimodalThresh (histogram-trough thresholding)
+threshold:                         # how every between-mode threshold is placed
+  method: kde                      # kde | histogram -- see docs/threshold_comparison.md.
+                                   # 'histogram' returns an unusable threshold in 18/48 tested
+                                   # series x combo cases; 'kde' agrees with it where it works and
+                                   # repairs it where it fails. Either can return NaN on a unimodal
+                                   # metric (kde warns), which empties the dependent state mask.
+  kde_grid_n: 512                  # evaluation grid for the KDE trough search
+
+bimodal_threshold:                 # buzcode bz_BimodalThresh (used when threshold.method=histogram)
   startbins: 12                    # coarsest histogram tried
   maxbins: 25                      # finest histogram tried; first bin count with a 2-peak split wins
+
+duration_criteria:                 # Watson et al. 2016 supplementary period definitions
+  merge_shorter_than_s: 2          # runs no longer than this take the preceding state (de-flicker)
+  min_state_s: 20                  # Watson's minimum for a nonREM packet and for REM; shorter NREM/
+                                   # REM runs do not qualify and fall to wake. Applied after the
+                                   # merge and before MA labelling, so MA is scored against packets.
+  microarousal_max_s: 40           # MA: wake run shorter than this, flanked by NREM on both sides
 
 theta:
   conventions:
     watson:   {theta: [5, 10], denom: [2, 16]}    # Watson et al. 2016
     shin:     {theta: [6, 12], denom: [1, 4]}     # Shin et al. 2026
     shin_mod: {theta: [5, 10], denom: [1, 4]}     # local default
+  movement_conditioned: true       # theta trough taken on ~nrem & ~mov -- always, not as buzcode's
+                                   # fallback from ~mov. ~mov is 85-92% NREM, so its trough marks the
+                                   # NREM/non-NREM boundary, not REM vs quiet wake; on ProbeB it
+                                   # clears the prominence floor marginally (0.024) and so never fell
+                                   # back, putting REM on the wrong split. ~nrem & ~mov leaves the
+                                   # wake+REM population, prominence ~0.22 (ProbeB/lfp_cmr, 22 h).
+                                   # Briefly set false (2026-07-31); reverted, because the
+                                   # unconditioned trough mostly marks the NREM/non-NREM boundary
+                                   # (the low-theta mode IS the NREM population), which the ~nrem
+                                   # term already handles. See docs/threshold_comparison.md §5.
   concordant_convention: watson    # convention used for the buzcode-order concordant theta threshold
   report_conventions: [watson, shin, shin_mod]   # extra conventions to also report (theta_metric_<name>);
                                    # override per-call via score_recording's theta_conventions arg
@@ -47,3 +72,7 @@ imu:
   kinematics:                           # imu_kinematics translational-speed derivation
     highpass_fc_hz: 0.3
     highpass_order: 2
+  accel_motion:                         # accel_motion_buzcode (bz_getIntanAccel motion recipe)
+    low_hz: 0.1                         # bandpass corners, applied at the native IMU rate
+    high_hz: 1.0
+    order: 2
