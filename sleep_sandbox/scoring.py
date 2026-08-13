@@ -12,11 +12,66 @@ import matplotlib.pyplot as plt
 
 from sleep_sandbox.analysis import (
     broadband_pc1, select_channel_by_dip, select_theta_channel, select_theta_channel_peak,
-    log_spectrogram, smooth_norm, bimodal_thresh, theta_ratio, conditioned_theta_thresh,
+    log_spectrogram, smooth_norm, find_thresh, theta_ratio, conditioned_theta_thresh,
     bin_max, bin_var, zscore, make_emg_pairs, emg_from_lfp,
+    state_codes, merge_short_states, drop_short_packets, label_microarousals,
 )
 
 CORE_METRICS = ("sw_metric", "theta_metric", "motion_metric", "imu_speed")
+
+
+STATES = ("nrem", "rem", "wake")
+
+
+def classify(sw_metric, theta_metric, motion_metric, sw_thresh, startbins=12, maxbins=25,
+             method="histogram", grid_n=512, dt=1.0, merge_shorter_than_s=None,
+             min_state_s=None, microarousal_max_s=None, theta_conditioned=True,
+             motion_thresh=None, th_thresh=None):
+    """buzcode ClusterStates_DetermineStates decision tree on already-smoothed/[0,1] metrics:
+    motion threshold -> movement-conditioned theta threshold -> NREM/REM/WAKE masks, then the
+    Watson duration criteria. Split out of score_recording so alternative motion signals (IMU
+    variants) run through identical logic. Returns a dict of masks (nrem/rem/wake/qwake/ma/
+    rem_cand/mov) and the thresholds used.
+
+    wake = everything not NREM or REM; qwake (quiet wake) is buzcode's optional low-theta subset of
+    wake, and ma (microarousal) is Watson's short-wake-between-NREM subset. States nrem/rem/wake
+    partition every epoch exactly once; qwake and ma are subsets of wake, not separate states.
+
+    method: 'histogram' (buzcode bz_BimodalThresh) or 'kde' -- see docs/threshold_comparison.md.
+    Either can return a NaN threshold on a unimodal metric, which yields an empty mask downstream.
+    merge_shorter_than_s: runs no longer than this take the preceding state (None = off).
+    min_state_s: NREM/REM runs shorter than this become wake (None = off).
+    microarousal_max_s: MA upper bound (None = off). rem_cand/mov are pre-merge intermediates.
+    motion_thresh/th_thresh override the thresholds this would derive from the passed metrics, so
+    thresholds estimated on one window can be applied to another (check_threshold_stability.py)."""
+    if motion_thresh is None:
+        motion_thresh = find_thresh(motion_metric, method, startbins, maxbins, grid_n, label="motion")
+    derived_th, mov = conditioned_theta_thresh(
+        theta_metric, sw_metric, motion_metric, sw_thresh, motion_thresh, startbins, maxbins,
+        method, grid_n, theta_conditioned)
+    if th_thresh is None:
+        th_thresh = derived_th
+
+    nrem = sw_metric > sw_thresh
+    low_motion = motion_metric < motion_thresh
+    rem_cand = ~nrem & low_motion
+    rem = rem_cand & (theta_metric > th_thresh)
+    wake = ~nrem & ~rem
+
+    codes = state_codes({"nrem": nrem, "rem": rem, "wake": wake}, STATES)
+    if merge_shorter_than_s:
+        codes = merge_short_states(codes, dt, merge_shorter_than_s)
+    if min_state_s:                       # after the merge, before MA: MA is defined against packets
+        codes = drop_short_packets(codes, dt, min_state_s, STATES.index("wake"))
+    if merge_shorter_than_s or min_state_s:
+        nrem, rem, wake = (codes == i for i in range(len(STATES)))
+
+    ma =(label_microarousals(codes, dt, STATES.index("wake"), STATES.index("nrem"), microarousal_max_s)
+          if microarousal_max_s else np.zeros(len(codes), dtype=bool))
+
+    return {"nrem": nrem, "rem": rem, "wake": wake, "qwake": wake & (theta_metric <= th_thresh),
+            "ma": ma, "rem_cand": rem_cand, "mov": mov,
+            "motion_thresh": motion_thresh, "th_thresh": th_thresh}
 
 
 def score_recording(recording_lfp, recording_emg, scoring_config,
@@ -44,6 +99,8 @@ def score_recording(recording_lfp, recording_emg, scoring_config,
     smooth_win_s = scoring_config["smoothing"]["window_s"]
     bt_startbins = scoring_config["bimodal_threshold"]["startbins"]
     bt_maxbins = scoring_config["bimodal_threshold"]["maxbins"]
+    thresh_cfg = scoring_config["threshold"]
+    dur_cfg = scoring_config["duration_criteria"]
 
     # Slow-wave: dip-test channel selection -> PC1 -> smoothed/normed metric -> threshold.
     print(f"  [score_recording] slow-wave channel selection (dip test, every {channel_stride}th channel)...",
@@ -56,7 +113,8 @@ def score_recording(recording_lfp, recording_emg, scoring_config,
     sw_pc1, _, _, _, times = broadband_pc1(
         sw_trace, fs, pc=pc_index, orientation_freq_hz=orientation_freq_hz, **spectrogram_kwargs)
     sw_metric = smooth_norm(sw_pc1, step_s=step_s, win_s=smooth_win_s)
-    sw_thresh = bimodal_thresh(sw_metric, bt_startbins, bt_maxbins)
+    sw_thresh = find_thresh(sw_metric, thresh_cfg["method"], bt_startbins, bt_maxbins,
+                            thresh_cfg["kde_grid_n"], label="slow_wave")
 
     # Theta: peakTH channel selection, then the concordant convention's ratio on that channel.
     peak_band = scoring_config["theta"]["channel_peak_band"]
@@ -90,23 +148,20 @@ def score_recording(recording_lfp, recording_emg, scoring_config,
     emg_score, emg_times = emg_from_lfp(recording_emg, emg_pairs, win_s=emg_cfg["window_s"])
     emg_b = np.interp(times, emg_times, emg_score)
     motion_metric = smooth_norm(emg_b, step_s=step_s, win_s=smooth_win_s)
-    motion_thresh = bimodal_thresh(motion_metric, bt_startbins, bt_maxbins)
 
-    print("  [score_recording] movement-conditioned theta threshold...", flush=True)
-    th_thresh, movtimes = conditioned_theta_thresh(
-        theta_metric, sw_metric, motion_metric, sw_thresh, motion_thresh, bt_startbins, bt_maxbins)
-
-    not_nrem = sw_metric < sw_thresh
-    low_tone = motion_metric < motion_thresh
-    rem_cand = not_nrem & low_tone
-    rem = rem_cand & (theta_metric > th_thresh)
+    print("  [score_recording] movement-conditioned theta threshold + states...", flush=True)
+    states = classify(sw_metric, theta_metric, motion_metric, sw_thresh, bt_startbins, bt_maxbins,
+                      thresh_cfg["method"], thresh_cfg["kde_grid_n"], dt=step_s,
+                      merge_shorter_than_s=dur_cfg["merge_shorter_than_s"],
+                      min_state_s=dur_cfg["min_state_s"],
+                      microarousal_max_s=dur_cfg["microarousal_max_s"],
+                      theta_conditioned=scoring_config["theta"]["movement_conditioned"])
 
     result = {
         "times": times, "sw_pc1": sw_pc1,
         "sw_metric": sw_metric, "theta_metric": theta_metric, "motion_metric": motion_metric,
-        "nrem": ~not_nrem, "mov": movtimes, "rem_cand": rem_cand, "rem": rem,
-        "sw_channel": sw_channel, "theta_channel": th_channel,
-        "sw_thresh": sw_thresh, "motion_thresh": motion_thresh, "th_thresh": th_thresh,
+        "sw_channel": sw_channel, "theta_channel": th_channel, "sw_thresh": sw_thresh,
+        **states,
         **extra_theta,
     }
 
@@ -350,6 +405,8 @@ def plot_notebook_figures(result, extras, scoring_config, out_dir=None):
     smooth_win_s = scoring_config["smoothing"]["window_s"]
     bt_startbins = scoring_config["bimodal_threshold"]["startbins"]
     bt_maxbins = scoring_config["bimodal_threshold"]["maxbins"]
+    thresh_cfg = scoring_config["threshold"]
+    theta_cond = scoring_config["theta"]["movement_conditioned"]
     conventions = list(scoring_config["theta"]["conventions"])
     sw_channel = int(result["sw_channel"])
     sw_thresh = float(result["sw_thresh"])
@@ -448,9 +505,11 @@ def plot_notebook_figures(result, extras, scoring_config, out_dir=None):
     motion_metrics = {}
     for name, sig in motion_candidates.items():
         m = smooth_norm(sig, step_s=step_s, win_s=smooth_win_s)
-        mt = bimodal_thresh(m, bt_startbins, bt_maxbins)
+        mt = find_thresh(m, thresh_cfg["method"], bt_startbins, bt_maxbins, thresh_cfg["kde_grid_n"],
+                         label=f"motion:{name}")
         tht, mov = conditioned_theta_thresh(
-            result["theta_metric"], result["sw_metric"], m, sw_thresh, mt, bt_startbins, bt_maxbins)
+            result["theta_metric"], result["sw_metric"], m, sw_thresh, mt, bt_startbins, bt_maxbins,
+            thresh_cfg["method"], thresh_cfg["kde_grid_n"], theta_cond)
         motion_metrics[name] = (m, mt, mov, tht)
     fig, ax = plt.subplots(1, len(motion_metrics), figsize=(16, 3.2), dpi=150, sharey=True)
     for a, (name, (m, mt, mov, tht)) in zip(ax, motion_metrics.items()):
@@ -469,7 +528,8 @@ def plot_notebook_figures(result, extras, scoring_config, out_dir=None):
     for i, conv in enumerate(conventions):
         tm = smooth_norm(extras[f"theta_own_ratio_{conv}"], step_s=step_s, win_s=smooth_win_s)
         tht, _ = conditioned_theta_thresh(
-            tm, result["sw_metric"], result["motion_metric"], sw_thresh, motion_thresh, bt_startbins, bt_maxbins)
+            tm, result["sw_metric"], result["motion_metric"], sw_thresh, motion_thresh, bt_startbins,
+            bt_maxbins, thresh_cfg["method"], thresh_cfg["kde_grid_n"], theta_cond)
         ax[i].hist(tm, bins=50, density=True, alpha=0.4, label="all epochs")
         ax[i].hist(tm[~mov], bins=50, density=True, alpha=0.4, label="non-moving")
         ax[i].axvline(tht, color="r", ls="--", label=f"THthresh={tht:.3f}")
