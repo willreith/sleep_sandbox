@@ -30,9 +30,9 @@ probe = sys.argv[1]                            # "ProbeA" or "ProbeB"
 data_dir    = Path(os.environ["PREPRO_RAW_DIR"])
 session_dir = data_dir.parent                 # datetime dir holding the probe config + NeuropixelsV2/
 base_dir    = Path(os.environ["PREPRO_OUTPUT_DIR"])
-suffixes    = range(5, 8)                  # 48 segments (~8.1 h)
+suffixes    = range(5, 149)                  # 48 segments (~8.1 h)
 
-n_jobs        = 4        # per-worker peak is large (30s chunk + 24s margin, float32, + resample buffers)
+n_jobs        = 6        # per-worker peak is large (30s chunk + 24s margin, float32, + resample buffers)
 chunk         = "30s"
 
 with open(repo_root / "config/preprocessing.yml") as f:
