@@ -4,9 +4,9 @@
 #SBATCH --array=0-1
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
-#SBATCH --cpus-per-task=4
-#SBATCH --mem=96G
-#SBATCH --time=24:00:00
+#SBATCH --cpus-per-task=6
+#SBATCH --mem=128G
+#SBATCH --time=2-12
 
 # ---------------------------------------------------------------------------
 # Config: all paths come from the gitignored .env at the repo root.
