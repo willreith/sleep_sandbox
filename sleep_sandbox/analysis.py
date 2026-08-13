@@ -2,9 +2,12 @@
 PC1 metric, narrowband theta ratios, most-bimodal channel selection, and grid reductions.
 Operates on 1250 Hz LFP; buzcode SleepScoreLFP / Watson et al. 2016 conventions."""
 
+import warnings
+
 import numpy as np
 import scipy.signal as signal
 
+from scipy.stats import gaussian_kde
 from sklearn.decomposition import PCA
 from sklearn.mixture import GaussianMixture
 from diptest import diptest
@@ -86,6 +89,45 @@ def bimodal_thresh(x, startbins=12, maxbins=25):
     return np.nan
 
 
+def kde_thresh(x, grid_n=512, min_prominence_frac=0.01, label=""):
+    """Between-mode threshold as the deepest trough of a Gaussian KDE (Scott's rule) between its two
+    most prominent peaks.
+
+    min_prominence_frac: a peak must rise this fraction of the maximum density above its
+    surroundings to count as a mode. Required, not cosmetic -- with no floor, floating-point ripple
+    in the near-zero tails registers as a "mode" and a unimodal Gaussian yields a threshold out in
+    its own tail. This is the KDE analogue of bimodal_thresh's zero-padded edge bin being taken as
+    a second mode (docs/threshold_comparison.md §4a).
+
+    Returns NaN, with a RuntimeWarning naming the metric, when fewer than two modes clear the floor.
+    That is the honest answer for a unimodal metric -- and it is a real outcome here, not a corner
+    case: several of the series x combo cases in docs/threshold_comparison.md, concentrated on
+    ProbeA theta, which the dip test independently calls unimodal (p >= 0.99). NaN propagates:
+    comparisons against it are all-False, so classify() yields an empty mask rather than raising."""
+    grid = np.linspace(x.min(), x.max(), grid_n)
+    dens = gaussian_kde(x)(grid)
+    peaks, props = signal.find_peaks(dens, prominence=min_prominence_frac * dens.max())
+    if len(peaks) < 2:
+        warnings.warn(f"kde_thresh({label or 'unnamed'}): density has {len(peaks)} mode(s), no "
+                      "two-mode split -> NaN threshold; the dependent state mask will be empty",
+                      RuntimeWarning, stacklevel=2)
+        return np.nan
+    lo, hi = np.sort(peaks[np.argsort(props["prominences"])[-2:]])
+    return grid[lo + np.argmin(dens[lo:hi + 1])]
+
+
+def find_thresh(x, method="histogram", startbins=12, maxbins=25, grid_n=512,
+                min_prominence_frac=0.01, label=""):
+    """Dispatch to the configured between-mode threshold method (config threshold.method).
+    'histogram' is buzcode's bz_BimodalThresh; 'kde' is the KDE trough, which agrees with it where
+    it works and repairs it where it fails -- see docs/threshold_comparison.md."""
+    if method == "kde":
+        return kde_thresh(x, grid_n=grid_n, min_prominence_frac=min_prominence_frac, label=label)
+    if method == "histogram":
+        return bimodal_thresh(x, startbins, maxbins)
+    raise ValueError(f"unknown threshold method: {method!r} (expected 'kde' or 'histogram')")
+
+
 def pc1_threshold(pc1, step_s=1.0):
     """Step 5 (buzcode-concordant): between-mode threshold as the histogram trough of the 15 s-smoothed,
     [0, 1]-normalised PC1. NOTE the threshold is in smoothed/normalised units -- compare it against
@@ -160,17 +202,28 @@ def select_theta_channel_peak(rec, fs, theta=(5, 10), denom=(2, 20), stride=16, 
 
 
 def conditioned_theta_thresh(theta_metric, sw_metric, motion_metric, sw_thresh, motion_thresh,
-                             startbins=12, maxbins=25):
-    """buzcode movement-conditioned theta threshold (ClusterStates_GetMetrics): the theta trough is
-    taken only on non-moving epochs. MOVtimes = low SW & high motion; the theta dip is found on
-    ~MOVtimes, and if that isn't bimodal, retried also excluding NREM (~NREMtimes & ~MOVtimes).
-    All inputs are the smoothed/[0,1] metrics on the same grid. Returns (th_thresh, movtimes)."""
-    nrem = sw_metric > sw_thresh
+                             startbins=12, maxbins=25, method="histogram", grid_n=512,
+                             conditioned=True):
+    """Movement-conditioned theta threshold, buzcode ClusterStates_GetMetrics with one deviation:
+    the trough is always taken on ~NREMtimes & ~MOVtimes, where buzcode takes it on ~MOVtimes and
+    only excludes NREM as a fallback. MOVtimes = low SW & high motion. All inputs are the
+    smoothed/[0,1] metrics on the same grid. Returns (th_thresh, movtimes).
+
+    The fallback order is wrong for this dataset. ~mov is 85-92% NREM, so its trough marks the
+    NREM/non-NREM boundary rather than the REM/quiet-wake one the theta threshold exists to place,
+    and on ProbeB it clears the prominence floor just well enough (0.024) never to fall back --
+    silently putting REM detection on the wrong split. Excluding NREM leaves the wake+REM
+    population, where the same split carries ~10x the mode prominence (0.22 on ProbeB/lfp_cmr over
+    22 h). That subset is smaller, which is what the longer recording buys back.
+
+    conditioned=False takes the trough on the full distribution instead; movtimes is returned either
+    way, since downstream plots and result.npz report it regardless of how the threshold was set."""
     mov = (sw_metric < sw_thresh) & (motion_metric > motion_thresh)
-    th = bimodal_thresh(theta_metric[~mov], startbins, maxbins)
-    if np.isnan(th):
-        th = bimodal_thresh(theta_metric[~nrem & ~mov], startbins, maxbins)
-    return th, mov
+    if not conditioned:
+        return find_thresh(theta_metric, method, startbins, maxbins, grid_n, label="theta|all"), mov
+    keep = ~(sw_metric > sw_thresh) & ~mov
+    return find_thresh(theta_metric[keep], method, startbins, maxbins, grid_n,
+                       label="theta|~nrem&~mov"), mov
 
 
 # --- Intracranial EMG proxy ---------------------------------------------------
@@ -240,12 +293,129 @@ def bin_max(t, x, grid):
 
 
 def bin_var(t, x, grid):
-    """Per-grid-bin variance of x (buzcode 'data_var' analogue for accelerometer motion); NaN for
-    empty bins. Nearest-bin assignment, like bin_max (but no out-of-range drop -- callers pass
-    already-valid samples)."""
+    """Per-grid-bin variance of x; NaN for empty bins. Nearest-bin assignment, like bin_max (but no
+    out-of-range drop -- callers pass already-valid samples). NB: no buzcode precedent -- buzcode
+    has no accelerometer variance measure anywhere (see docs/ANALYSIS_FRAMEWORK.md); this is a
+    local tone-like candidate."""
     idx = np.searchsorted(grid, t).clip(0, len(grid) - 1)
     c = np.bincount(idx, minlength=len(grid)).astype(float)
     s = np.bincount(idx, weights=x, minlength=len(grid))
     s2 = np.bincount(idx, weights=x * x, minlength=len(grid))
     c[c == 0] = np.nan
     return s2 / c - (s / c) ** 2
+
+
+def bin_mean(t, x, grid):
+    """Per-grid-bin mean of x; NaN for empty bins. Matches buzcode bz_getIntanAccel's final step
+    (bin-average the filtered motion magnitude), unlike bin_max which takes the per-bin peak."""
+    idx = np.searchsorted(grid, t).clip(0, len(grid) - 1)
+    c = np.bincount(idx, minlength=len(grid)).astype(float)
+    s = np.bincount(idx, weights=x, minlength=len(grid))
+    c[c == 0] = np.nan
+    return s / c
+
+
+def accel_motion_buzcode(accel, t, grid, low_hz=0.1, high_hz=1.0, order=2):
+    """buzcode bz_getIntanAccel's motion proxy applied to an acceleration magnitude: bandpass
+    (low_hz-high_hz, Butterworth, filtfilt) -> abs -> per-bin mean onto grid. buzcode bandpasses the
+    vector-norm of raw 3-axis accelerometer voltage; here `accel` is already a magnitude
+    (imu_kinematics' |LinearAcceleration|, gravity removed)."""
+    fs = 1.0 / np.median(np.diff(t))
+    b, a = signal.butter(order, [low_hz / (fs / 2), high_hz / (fs / 2)], btype="band")
+    return bin_mean(t, np.abs(signal.filtfilt(b, a, accel)), grid)
+
+
+# --- Classification-comparison diagnostics --------------------------------------
+def state_codes(states, state_names):
+    """states: dict of boolean masks, one per name in state_names, partitioning every epoch
+    exactly once -> one integer code per epoch (index into state_names)."""
+    codes = np.full(len(states[state_names[0]]), -1, dtype=int)
+    for i, name in enumerate(state_names):
+        codes[states[name]] = i
+    assert (codes >= 0).all(), "states do not partition all epochs"
+    return codes
+
+
+def confusion(a, b, n_states):
+    """a, b: integer state-code arrays (state_codes) over the same epochs -> n_states x n_states
+    confusion matrix, rows indexed by a, columns by b."""
+    return np.bincount(a * n_states + b, minlength=n_states ** 2).reshape(n_states, n_states)
+
+
+def cohens_kappa(a, b, n_states):
+    """Chance-corrected agreement between two state-code sequences over the same epochs. Raw
+    agreement (trace/n) is inflated whenever one state dominates; kappa subtracts the agreement
+    expected from each sequence's own marginal frequencies before rescaling."""
+    cm = confusion(a, b, n_states)
+    n = cm.sum()
+    po = np.trace(cm) / n
+    pe = (cm.sum(0) * cm.sum(1)).sum() / n ** 2
+    return (po - pe) / (1 - pe) if pe < 1 else np.nan
+
+
+def state_intervals(mask, t, dt):
+    """Contiguous True-runs of a boolean state mask as (start_time, duration) pairs, for
+    ax.broken_barh. dt is the epoch width (grid spacing), so a single-epoch run still renders as
+    a dt-wide bar rather than a zero-width one."""
+    padded = np.concatenate(([0], mask.astype(int), [0]))
+    edges = np.diff(padded)
+    starts = np.flatnonzero(edges == 1)
+    ends = np.flatnonzero(edges == -1)
+    return list(zip(t[starts], (ends - starts) * dt))
+
+
+def bout_durations(mask, dt):
+    """Contiguous-run lengths (seconds) of a boolean state mask."""
+    return np.array([d for _, d in state_intervals(mask, np.zeros(len(mask)), dt)])
+
+
+# --- Watson duration criteria -------------------------------------------------
+# Watson et al. 2016 supplementary defines each period type by a minimum duration as well as by its
+# metric thresholds. Implemented so far: the short-run merge below and microarousals. The 20 s
+# minimum for nonREM packets and REM is NOT implemented -- deliberately deferred, so a bout that
+# clears the thresholds is currently kept regardless of length. Watson's episode-level definitions
+# (REM/nonREM episodes tolerating <=40 s interruptions, SLEEP, WAKE, WAKE-SLEEP cycle) are also not
+# implemented; our nrem/rem are packets, not episodes.
+def run_bounds(codes):
+    """Contiguous runs of an integer code array as (start_idx, stop_idx, value) arrays."""
+    change = np.flatnonzero(np.diff(codes)) + 1
+    starts = np.concatenate(([0], change))
+    stops = np.concatenate((change, [len(codes)]))
+    return starts, stops, codes[starts]
+
+
+def merge_short_states(codes, dt, max_s):
+    """Runs lasting <= max_s take the preceding run's state (de-flicker). Single left-to-right pass,
+    reading the already-updated predecessor, so consecutive short runs cascade into one state rather
+    than each inheriting the original labels. The first run has no predecessor and is left as-is."""
+    out = codes.copy()
+    starts, stops, _ = run_bounds(codes)
+    for i in range(1, len(starts)):
+        if (stops[i] - starts[i]) * dt <= max_s:
+            out[starts[i]:stops[i]] = out[starts[i] - 1]
+    return out
+
+
+def drop_short_packets(codes, dt, min_s, wake_code):
+    """Watson: a nonREM packet is 20+ s of nonREM and REM is 20+ s of REM, so shorter NREM/REM runs
+    do not qualify and fall to the residual class, wake. Single pass over the pre-pass run bounds,
+    so a demoted REM and a short NREM beside it are both caught without cascading."""
+    out = codes.copy()
+    starts, stops, vals = run_bounds(codes)
+    for i in range(len(starts)):
+        if vals[i] != wake_code and (stops[i] - starts[i]) * dt < min_s:
+            out[starts[i]:stops[i]] = wake_code
+    return out
+
+
+def label_microarousals(codes, dt, wake_code, nrem_code, max_s):
+    """Watson microarousal: a WAKE run (i.e. neither NREM nor REM) shorter than max_s, flanked by
+    NREM on both sides. Returned as a boolean mask -- MA is a subset of wake, not a fourth state, so
+    the nrem/rem/wake partition is unchanged (mirrors how qwake is reported)."""
+    ma = np.zeros(len(codes), dtype=bool)
+    starts, stops, vals = run_bounds(codes)
+    for i in range(1, len(starts) - 1):
+        if vals[i] == wake_code and vals[i - 1] == nrem_code and vals[i + 1] == nrem_code \
+                and (stops[i] - starts[i]) * dt < max_s:
+            ma[starts[i]:stops[i]] = True
+    return ma
