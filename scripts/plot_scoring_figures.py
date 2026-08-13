@@ -1,12 +1,16 @@
 """Generate the notebook-style diagnostic figures (sleep_sandbox.scoring.plot_notebook_figures)
-for existing sleep-scoring results under data/derivatives/{Probe}/{variant}/result.npz. Reloads the
+for existing sleep-scoring results under data/derivatives/{seg}/{Probe}/{variant}/result.npz. Reloads the
 lfp_cmr/lfp_nocmr + emg derivatives and aligned IMU (same pattern as run_scoring.py) to recompute the
 extra raw signals plot_notebook_figures needs (notebook_extras: per-convention theta channels,
 spectrogram, raw EMG, IMU angular/accel); these are cached to result_extras.npz next to each
 result.npz so a rerun skips the recompute. Requires run_scoring.py to have already been run for the
 combo(s) being plotted.
 
-Usage: python plot_scoring_figures.py [--out-base data/derivatives] [--probe ProbeA|ProbeB] [--variant lfp_cmr|lfp_nocmr]
+Figures go into {out_base}/{seg}/{probe}/{variant}/metrics/; result_extras.npz stays at the combo
+root alongside result.npz, since the comparison scripts read both from there.
+
+Usage: python plot_scoring_figures.py --seg seg5-148 [--out-base data/derivatives]
+                                      [--probe ProbeA|ProbeB] [--variant lfp_cmr|lfp_nocmr]
 Omitting --probe/--variant runs all 4 combos in one invocation.
 """
 
@@ -28,19 +32,20 @@ repo_root = Path(__file__).resolve().parent.parent
 load_dotenv(repo_root / ".env")
 
 parser = argparse.ArgumentParser()
+parser.add_argument("--seg", required=True,
+                     help="preprocessed segment range, e.g. 'seg5-148'; selects both the "
+                          "$PREPRO_OUTPUT_DIR/{probe}_{seg} inputs and the {out_base}/{seg} outputs")
 parser.add_argument("--out-base", type=Path, default=repo_root / "data" / "derivatives",
-                     help="base dir; reads/writes under {out_base}/{probe}/{variant}/")
+                     help="base dir; reads/writes under {out_base}/{seg}/{probe}/{variant}/")
 parser.add_argument("--probe", choices=["ProbeA", "ProbeB"], help="run only this probe (default: both)")
 parser.add_argument("--variant", choices=["lfp_cmr", "lfp_nocmr"],
                      help="run only this LFP variant (default: both)")
 args = parser.parse_args()
-out_base = args.out_base
+out_base = args.out_base / args.seg
 
 raw_dir = Path(os.environ["PREPRO_RAW_DIR"])
-probes = {
-    "ProbeA": Path(os.environ["PROBEA_DERIV_DIR"]),
-    "ProbeB": Path(os.environ["PROBEB_DERIV_DIR"]),
-}
+prepro_base = Path(os.environ["PREPRO_OUTPUT_DIR"])
+probes = {p: prepro_base / f"{p}_{args.seg}" for p in ("ProbeA", "ProbeB")}
 if args.probe:
     probes = {args.probe: probes[args.probe]}
 variants = [args.variant] if args.variant else ["lfp_cmr", "lfp_nocmr"]
@@ -95,8 +100,8 @@ for probe, deriv_dir in probes.items():
             imu_t, imu_valid, imu_ang, imu_accel, result,
             cache_path=out_dir / "result_extras.npz")
 
-        print(f"plotting -> {out_dir}...", flush=True)
-        plot_notebook_figures(result, extras, scoring_config, out_dir=out_dir)
+        print(f"plotting -> {out_dir / 'metrics'}...", flush=True)
+        plot_notebook_figures(result, extras, scoring_config, out_dir=out_dir / "metrics")
         print(f"--- {probe} {variant} done ---", flush=True)
 
 print("ALL PLOTS COMPLETE")
