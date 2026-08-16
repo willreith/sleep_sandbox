@@ -21,6 +21,7 @@ dependencies = [
     "spython",
     "kilosort",
     "streamlit",          # interactive ripple-explorer GUI
+    "diptest",            # Hartigan's dip test for channel bimodality selection
 ]
 
 [project.optional-dependencies]

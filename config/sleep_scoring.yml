@@ -1,0 +1,85 @@
+# Sleep-scoring parameters for notebooks/buzsaki_sleep_scoring.ipynb (Watson et al. 2016 /
+# buzcode SleepScoreLFP conventions). These govern the classification algorithm itself, applied
+# to the already-preprocessed LFP/EMG; recording/filter parameters live in config/preprocessing.yml.
+
+channel_selection:
+  stride: 16                       # scan every Nth channel (dip-test / peakTH channel pick)
+  manual_slow_wave_channel: null   # override the dip-test slow-wave channel; null = automatic
+
+spectrogram:                       # shared STFT front-end (log_spectrogram)
+  window_s: 10.0                   # Hann window
+  step_s: 1.0                      # hop; also the metric bin width downstream
+  freq_min: 1.0
+  freq_max: 100.0
+  n_freq_bins: 100                 # log-spaced grid between freq_min and freq_max
+
+slow_wave:                         # broadband PC1 (steps 1-4, Watson et al.)
+  pc_index: 1                      # which principal component to use as the slow-wave score
+  orientation_freq_hz: 20.0        # sign-flip PC if the mean loading below this freq is negative
+
+smoothing:
+  window_s: 15.0                   # centred moving average applied before [0,1]-normalising a metric
+
+threshold:                         # how every between-mode threshold is placed
+  method: kde                      # kde | histogram -- see docs/threshold_comparison.md.
+                                   # 'histogram' returns an unusable threshold in 18/48 tested
+                                   # series x combo cases; 'kde' agrees with it where it works and
+                                   # repairs it where it fails. Either can return NaN on a unimodal
+                                   # metric (kde warns), which empties the dependent state mask.
+  kde_grid_n: 512                  # evaluation grid for the KDE trough search
+  min_prominence_frac: 0.03        # a KDE peak must rise this fraction of peak density above its
+                                   # surroundings to count as a mode; below two modes -> NaN.
+                                   # Separates the theta pools cleanly at 22 h: every ~mov pool
+                                   # sits at 0.001-0.024, every ~nrem & ~mov pool at 0.11-0.29,
+                                   # with nothing in between. At 1-2% the ~mov pool thresholds
+                                   # instead of refusing, which is how REM ended up on the
+                                   # NREM/non-NREM split under buzcode's fallback order.
+
+bimodal_threshold:                 # buzcode bz_BimodalThresh (used when threshold.method=histogram)
+  startbins: 12                    # coarsest histogram tried
+  maxbins: 25                      # finest histogram tried; first bin count with a 2-peak split wins
+
+duration_criteria:                 # Watson et al. 2016 supplementary period definitions
+  merge_shorter_than_s: 2          # runs no longer than this take the preceding state (de-flicker)
+  min_state_s: 20                  # Watson's minimum for a nonREM packet and for REM; shorter NREM/
+                                   # REM runs do not qualify and fall to wake. Applied after the
+                                   # merge and before MA labelling, so MA is scored against packets.
+  microarousal_max_s: 40           # MA: wake run shorter than this, flanked by NREM on both sides
+
+theta:
+  conventions:
+    watson:   {theta: [5, 10], denom: [2, 16]}    # Watson et al. 2016
+    shin:     {theta: [6, 12], denom: [1, 4]}     # Shin et al. 2026
+    shin_mod: {theta: [5, 10], denom: [1, 4]}     # local default
+  movement_conditioned: true       # theta trough taken on ~nrem & ~mov -- always, not as buzcode's
+                                   # fallback from ~mov. ~mov is 85-92% NREM, so its trough marks the
+                                   # NREM/non-NREM boundary, not REM vs quiet wake; on ProbeB it
+                                   # clears the prominence floor marginally (0.024) and so never fell
+                                   # back, putting REM on the wrong split. ~nrem & ~mov leaves the
+                                   # wake+REM population, prominence ~0.22 (ProbeB/lfp_cmr, 22 h).
+                                   # Setting this false is worse still: the unconditioned trough
+                                   # mostly marks the NREM/non-NREM boundary (the low-theta mode IS
+                                   # the NREM population), which the ~nrem term already handles.
+                                   # See docs/sleep_classification_algorithm.md, "Thresholding".
+  concordant_convention: watson    # convention used for the buzcode-order concordant theta threshold
+  report_conventions: [watson, shin, shin_mod]   # extra conventions to also report (theta_metric_<name>);
+                                   # override per-call via score_recording's theta_conventions arg
+  channel_peak_band:                # buzcode PickSWTHChannel band -- channel selection only, distinct
+    theta: [5, 10]                  # from the ratio conventions above (denom differs: 2-20 vs 2-16)
+    denom: [2, 20]
+
+emg:                                # intracranial EMG proxy (cross-shank high-frequency coherence)
+  n_pairs: 50                      # random channel pairs, spread round-robin across qualifying shank combos
+  min_shank_dist: 2                 # minimum shank separation between paired channels
+  window_s: 1.0                     # non-overlapping window for the Pearson r score
+  seed: 0
+
+imu:
+  movement_speed_threshold_mps: 0.04   # diagnostic moving/still split on translational speed
+  kinematics:                           # imu_kinematics translational-speed derivation
+    highpass_fc_hz: 0.3
+    highpass_order: 2
+  accel_motion:                         # accel_motion_buzcode (bz_getIntanAccel motion recipe)
+    low_hz: 0.1                         # bandpass corners, applied at the native IMU rate
+    high_hz: 1.0
+    order: 2
