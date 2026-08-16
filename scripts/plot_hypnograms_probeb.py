@@ -1,9 +1,9 @@
 """Condensed hypnograms for the go-forward ProbeB set: one colour-coded bar per configuration,
 stacked so states line up vertically for direct comparison.
 
-Configurations (docs/sleep_classification_algorithm.md §7.5):
-  lfp_cmr   + watson   primary
-  lfp_cmr   + shin     primary
+Configurations (docs/sleep_classification_algorithm.md, "Note on referencing"):
+  lfp_cmr   + watson
+  lfp_cmr   + shin
   lfp_nocmr + shin     CMR vs noCMR control
 
 Unlike plot_hypnograms_direct.py (one lane per state), each row here is a single lane in which

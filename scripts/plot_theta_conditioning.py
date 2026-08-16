@@ -6,7 +6,8 @@ distribution (blue), the ~mov subset (orange) and the ~nrem & ~mov pool (red out
 three thresholds. The orange pool is shifted left of blue in all 12 panels: conditioning removes
 locomotor theta, which is the high mode. Orange is labelled unused because
 conditioned_theta_thresh now always takes the red pool -- ~mov is 85-92% NREM, so its trough marks
-the NREM/non-NREM boundary rather than REM vs quiet wake. See docs/threshold_comparison.md §5.
+the NREM/non-NREM boundary rather than REM vs quiet wake. See
+docs/sleep_classification_algorithm.md, "Thresholding".
 
 Writes data/derivatives/{seg}/theta_conditioning_comparison.png.
 Usage: python plot_theta_conditioning.py --seg seg5-148

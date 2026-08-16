@@ -89,7 +89,7 @@ def bimodal_thresh(x, startbins=12, maxbins=25):
     return np.nan
 
 
-def kde_thresh(x, grid_n=512, min_prominence_frac=0.01, label=""):
+def kde_thresh(x, grid_n=512, min_prominence_frac=0.03, label=""):
     """Between-mode threshold as the deepest trough of a Gaussian KDE (Scott's rule) between its two
     most prominent peaks.
 
@@ -97,7 +97,7 @@ def kde_thresh(x, grid_n=512, min_prominence_frac=0.01, label=""):
     surroundings to count as a mode. Required, not cosmetic -- with no floor, floating-point ripple
     in the near-zero tails registers as a "mode" and a unimodal Gaussian yields a threshold out in
     its own tail. This is the KDE analogue of bimodal_thresh's zero-padded edge bin being taken as
-    a second mode (docs/threshold_comparison.md §4a).
+    a second mode (docs/threshold_comparison.md §2a).
 
     Returns NaN, with a RuntimeWarning naming the metric, when fewer than two modes clear the floor.
     That is the honest answer for a unimodal metric -- and it is a real outcome here, not a corner
@@ -117,7 +117,7 @@ def kde_thresh(x, grid_n=512, min_prominence_frac=0.01, label=""):
 
 
 def find_thresh(x, method="histogram", startbins=12, maxbins=25, grid_n=512,
-                min_prominence_frac=0.01, label=""):
+                min_prominence_frac=0.03, label=""):
     """Dispatch to the configured between-mode threshold method (config threshold.method).
     'histogram' is buzcode's bz_BimodalThresh; 'kde' is the KDE trough, which agrees with it where
     it works and repairs it where it fails -- see docs/threshold_comparison.md."""
@@ -203,7 +203,7 @@ def select_theta_channel_peak(rec, fs, theta=(5, 10), denom=(2, 20), stride=16, 
 
 def conditioned_theta_thresh(theta_metric, sw_metric, motion_metric, sw_thresh, motion_thresh,
                              startbins=12, maxbins=25, method="histogram", grid_n=512,
-                             conditioned=True):
+                             conditioned=True, min_prominence_frac=0.03):
     """Movement-conditioned theta threshold, buzcode ClusterStates_GetMetrics with one deviation:
     the trough is always taken on ~NREMtimes & ~MOVtimes, where buzcode takes it on ~MOVtimes and
     only excludes NREM as a fallback. MOVtimes = low SW & high motion. All inputs are the
@@ -220,10 +220,11 @@ def conditioned_theta_thresh(theta_metric, sw_metric, motion_metric, sw_thresh, 
     way, since downstream plots and result.npz report it regardless of how the threshold was set."""
     mov = (sw_metric < sw_thresh) & (motion_metric > motion_thresh)
     if not conditioned:
-        return find_thresh(theta_metric, method, startbins, maxbins, grid_n, label="theta|all"), mov
+        return find_thresh(theta_metric, method, startbins, maxbins, grid_n,
+                           min_prominence_frac, label="theta|all"), mov
     keep = ~(sw_metric > sw_thresh) & ~mov
     return find_thresh(theta_metric[keep], method, startbins, maxbins, grid_n,
-                       label="theta|~nrem&~mov"), mov
+                       min_prominence_frac, label="theta|~nrem&~mov"), mov
 
 
 # --- Intracranial EMG proxy ---------------------------------------------------

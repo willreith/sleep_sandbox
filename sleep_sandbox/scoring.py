@@ -26,7 +26,7 @@ STATES = ("nrem", "rem", "wake")
 def classify(sw_metric, theta_metric, motion_metric, sw_thresh, startbins=12, maxbins=25,
              method="histogram", grid_n=512, dt=1.0, merge_shorter_than_s=None,
              min_state_s=None, microarousal_max_s=None, theta_conditioned=True,
-             motion_thresh=None, th_thresh=None):
+             motion_thresh=None, th_thresh=None, min_prominence_frac=0.03):
     """buzcode ClusterStates_DetermineStates decision tree on already-smoothed/[0,1] metrics:
     motion threshold -> movement-conditioned theta threshold -> NREM/REM/WAKE masks, then the
     Watson duration criteria. Split out of score_recording so alternative motion signals (IMU
@@ -45,10 +45,11 @@ def classify(sw_metric, theta_metric, motion_metric, sw_thresh, startbins=12, ma
     motion_thresh/th_thresh override the thresholds this would derive from the passed metrics, so
     thresholds estimated on one window can be applied to another (check_threshold_stability.py)."""
     if motion_thresh is None:
-        motion_thresh = find_thresh(motion_metric, method, startbins, maxbins, grid_n, label="motion")
+        motion_thresh = find_thresh(motion_metric, method, startbins, maxbins, grid_n,
+                                    min_prominence_frac, label="motion")
     derived_th, mov = conditioned_theta_thresh(
         theta_metric, sw_metric, motion_metric, sw_thresh, motion_thresh, startbins, maxbins,
-        method, grid_n, theta_conditioned)
+        method, grid_n, theta_conditioned, min_prominence_frac)
     if th_thresh is None:
         th_thresh = derived_th
 
@@ -114,7 +115,8 @@ def score_recording(recording_lfp, recording_emg, scoring_config,
         sw_trace, fs, pc=pc_index, orientation_freq_hz=orientation_freq_hz, **spectrogram_kwargs)
     sw_metric = smooth_norm(sw_pc1, step_s=step_s, win_s=smooth_win_s)
     sw_thresh = find_thresh(sw_metric, thresh_cfg["method"], bt_startbins, bt_maxbins,
-                            thresh_cfg["kde_grid_n"], label="slow_wave")
+                            thresh_cfg["kde_grid_n"], thresh_cfg["min_prominence_frac"],
+                            label="slow_wave")
 
     # Theta: peakTH channel selection, then the concordant convention's ratio on that channel.
     peak_band = scoring_config["theta"]["channel_peak_band"]
@@ -155,7 +157,8 @@ def score_recording(recording_lfp, recording_emg, scoring_config,
                       merge_shorter_than_s=dur_cfg["merge_shorter_than_s"],
                       min_state_s=dur_cfg["min_state_s"],
                       microarousal_max_s=dur_cfg["microarousal_max_s"],
-                      theta_conditioned=scoring_config["theta"]["movement_conditioned"])
+                      theta_conditioned=scoring_config["theta"]["movement_conditioned"],
+                      min_prominence_frac=thresh_cfg["min_prominence_frac"])
 
     result = {
         "times": times, "sw_pc1": sw_pc1,
@@ -506,10 +509,11 @@ def plot_notebook_figures(result, extras, scoring_config, out_dir=None):
     for name, sig in motion_candidates.items():
         m = smooth_norm(sig, step_s=step_s, win_s=smooth_win_s)
         mt = find_thresh(m, thresh_cfg["method"], bt_startbins, bt_maxbins, thresh_cfg["kde_grid_n"],
-                         label=f"motion:{name}")
+                         thresh_cfg["min_prominence_frac"], label=f"motion:{name}")
         tht, mov = conditioned_theta_thresh(
             result["theta_metric"], result["sw_metric"], m, sw_thresh, mt, bt_startbins, bt_maxbins,
-            thresh_cfg["method"], thresh_cfg["kde_grid_n"], theta_cond)
+            thresh_cfg["method"], thresh_cfg["kde_grid_n"], theta_cond,
+            thresh_cfg["min_prominence_frac"])
         motion_metrics[name] = (m, mt, mov, tht)
     fig, ax = plt.subplots(1, len(motion_metrics), figsize=(16, 3.2), dpi=150, sharey=True)
     for a, (name, (m, mt, mov, tht)) in zip(ax, motion_metrics.items()):
@@ -529,7 +533,8 @@ def plot_notebook_figures(result, extras, scoring_config, out_dir=None):
         tm = smooth_norm(extras[f"theta_own_ratio_{conv}"], step_s=step_s, win_s=smooth_win_s)
         tht, _ = conditioned_theta_thresh(
             tm, result["sw_metric"], result["motion_metric"], sw_thresh, motion_thresh, bt_startbins,
-            bt_maxbins, thresh_cfg["method"], thresh_cfg["kde_grid_n"], theta_cond)
+            bt_maxbins, thresh_cfg["method"], thresh_cfg["kde_grid_n"], theta_cond,
+            thresh_cfg["min_prominence_frac"])
         ax[i].hist(tm, bins=50, density=True, alpha=0.4, label="all epochs")
         ax[i].hist(tm[~mov], bins=50, density=True, alpha=0.4, label="non-moving")
         ax[i].axvline(tht, color="r", ls="--", label=f"THthresh={tht:.3f}")

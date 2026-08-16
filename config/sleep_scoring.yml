@@ -27,6 +27,13 @@ threshold:                         # how every between-mode threshold is placed
                                    # repairs it where it fails. Either can return NaN on a unimodal
                                    # metric (kde warns), which empties the dependent state mask.
   kde_grid_n: 512                  # evaluation grid for the KDE trough search
+  min_prominence_frac: 0.03        # a KDE peak must rise this fraction of peak density above its
+                                   # surroundings to count as a mode; below two modes -> NaN.
+                                   # Separates the theta pools cleanly at 22 h: every ~mov pool
+                                   # sits at 0.001-0.024, every ~nrem & ~mov pool at 0.11-0.29,
+                                   # with nothing in between. At 1-2% the ~mov pool thresholds
+                                   # instead of refusing, which is how REM ended up on the
+                                   # NREM/non-NREM split under buzcode's fallback order.
 
 bimodal_threshold:                 # buzcode bz_BimodalThresh (used when threshold.method=histogram)
   startbins: 12                    # coarsest histogram tried
@@ -50,10 +57,10 @@ theta:
                                    # clears the prominence floor marginally (0.024) and so never fell
                                    # back, putting REM on the wrong split. ~nrem & ~mov leaves the
                                    # wake+REM population, prominence ~0.22 (ProbeB/lfp_cmr, 22 h).
-                                   # Briefly set false (2026-07-31); reverted, because the
-                                   # unconditioned trough mostly marks the NREM/non-NREM boundary
-                                   # (the low-theta mode IS the NREM population), which the ~nrem
-                                   # term already handles. See docs/threshold_comparison.md §5.
+                                   # Setting this false is worse still: the unconditioned trough
+                                   # mostly marks the NREM/non-NREM boundary (the low-theta mode IS
+                                   # the NREM population), which the ~nrem term already handles.
+                                   # See docs/sleep_classification_algorithm.md, "Thresholding".
   concordant_convention: watson    # convention used for the buzcode-order concordant theta threshold
   report_conventions: [watson, shin, shin_mod]   # extra conventions to also report (theta_metric_<name>);
                                    # override per-call via score_recording's theta_conventions arg

@@ -59,14 +59,16 @@ for probe in ["ProbeA", "ProbeB"]:
         shutil.copy2(yml_path, yml_path.with_suffix(".yml.bak"))
 
         sw_thresh = find_thresh(result["sw_metric"], thresh_cfg["method"], bt_startbins, bt_maxbins,
-                                thresh_cfg["kde_grid_n"], label=f"slow_wave[{probe}/{variant}]")
+                                thresh_cfg["kde_grid_n"], thresh_cfg["min_prominence_frac"],
+                                label=f"slow_wave[{probe}/{variant}]")
         states = classify(
             result["sw_metric"], result["theta_metric"], result["motion_metric"], sw_thresh,
             bt_startbins, bt_maxbins, thresh_cfg["method"], thresh_cfg["kde_grid_n"], dt=step_s,
             merge_shorter_than_s=dur_cfg["merge_shorter_than_s"],
             min_state_s=dur_cfg["min_state_s"],
             microarousal_max_s=dur_cfg["microarousal_max_s"],
-            theta_conditioned=scoring_config["theta"]["movement_conditioned"])
+            theta_conditioned=scoring_config["theta"]["movement_conditioned"],
+            min_prominence_frac=thresh_cfg["min_prominence_frac"])
 
         result.update({k: v for k, v in states.items() if isinstance(v, np.ndarray)})
         np.savez(npz_path, **{k: v for k, v in result.items() if isinstance(v, np.ndarray)})
