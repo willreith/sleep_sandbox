@@ -14,13 +14,14 @@
 # Config: all paths come from the gitignored .env at the repo root.
 # Submit from the repo root (cd there first) so $SLURM_SUBMIT_DIR points to it.
 #
-# Memory: all 16 channels (4 shanks x 1 candidate + 3 neighbours) are read in one pass and held,
+# Memory: all (1 candidate + 3 neighbours) x n_shanks channels are read in one pass and held,
 # because a single-channel read of a sample-interleaved binary touches every page of the recording
-# anyway -- 16 separate reads would be 16 full passes over ~123G. seg5-148 is 22.33 h at 1250 Hz =
-# 8.0e7 samples, so the resident batch is 16 x 8.0e7 float32 = 5.1G. On top of that one envelope is
-# computed at a time, peaking inside hilbert at ~3.2G (float64 trace + filtered + complex128 FFT
-# workspace + envelope, 0.64G each). ~8.3G total, so 24G is ~3x headroom.
-# Time: one pass over the derivative, then 16 x (sosfiltfilt + hilbert) on 8.0e7 samples, so now
+# anyway -- reading them separately would be that many full passes over ~123G. seg5-148 is 22.33 h
+# at 1250 Hz = 8.0e7 samples, so the resident batch is 5.1G for ProbeA (4 shanks, 16 channels) and
+# 3.9G for ProbeB (3 shanks, 12 -- its channel map leaves the x=219 shank empty). On top of that one
+# envelope is computed at a time, peaking inside hilbert at ~3.2G (float64 trace + filtered +
+# complex128 FFT workspace + envelope, 0.64G each). ~8.3G worst case, so 24G is ~3x headroom.
+# Time: one pass over the derivative, then 12-16 x (sosfiltfilt + hilbert) on 8.0e7 samples, so now
 # CPU-bound rather than I/O-bound. 3 h is headroom, not an estimate; /usr/bin/time -v measures the
 # first run.
 #
