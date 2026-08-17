@@ -1,19 +1,29 @@
 """Detect ripples on the NREM epochs of a preprocessed LFP derivative and write an event table.
 
-Usage: python run_ripples.py --seg seg5-148 [--probe ProbeB] [--variant lfp_cmr]
-                             [--channel N] [--out-base data/derivatives]
+Usage: python run_ripples.py --seg seg5-148 [--probe ProbeB] [--out-base data/derivatives]
 
-Requires run_scoring.py to have already run: the NREM mask and the baseline pool come from
-{out_base}/{seg}/{probe}/{variant}/result.npz, so --seg/--probe/--variant must name a combo that
-has been scored. Detection is always restricted to NREM; baseline.pool in config/ripple.yml only
-controls which samples the z-score mean/SD is estimated on.
+Requires two earlier runs for this seg/probe: run_scoring.py (the NREM mask and the z-score
+baseline pool come from its result.npz) and select_ripple_channel.py (the per-shank detection
+channels come from its channel_selection.yml). Detection is always restricted to NREM;
+baseline.pool in config/ripple.yml only controls which samples the mean/SD is estimated on.
 
-EVERY candidate event is written with its corroborating-neighbour count, so sweeping
-neighbours.n_required is a filter on the saved table rather than a rerun.
+Detection runs on every shank, each with its own three neighbours, into one flat event table with
+`shank` and `channel` columns. Shanks off the CA1 pyramidal layer are NOT skipped -- ProbeA is PFC
+and is the negative control, so what an unconverged selection detects is the point. Use the
+`spikiness` recorded per shank in events.yml to filter afterwards.
+
+Output goes to {seg}/{probe}/ripples/events/{run_id}/, where run_id is an 8-hex digest of the
+parameters that determine the event set (see `run_params` below), so a parameter sweep accumulates
+side-by-side directories and a rerun of the same parameters overwrites in place. events/runs.yml
+indexes them. neighbours.n_required is deliberately NOT hashed: every candidate is written with its
+corroborating-neighbour count, so sweeping n_required is a filter on the saved table rather than a
+rerun, and hashing it would split byte-identical outputs across directories.
 """
 
 import os
 import argparse
+import hashlib
+from datetime import datetime
 from pathlib import Path
 
 import numpy as np
@@ -22,9 +32,8 @@ from dotenv import load_dotenv
 from probeinterface import read_probeinterface
 
 from sleep_sandbox.io import load_preprocessed, find_amplifier_files
-from sleep_sandbox.ripple import (compute_psd, band_power, shank_index, neighbour_channels,
-                                  bandpass_envelope, zscore_envelope, epoch_mask_to_samples,
-                                  detect_events, count_corroborating)
+from sleep_sandbox.ripple import (neighbour_channels, bandpass_envelope, zscore_envelope,
+                                  epoch_mask_to_samples, detect_events, count_corroborating)
 
 repo_root = Path(__file__).resolve().parent.parent
 load_dotenv(repo_root / ".env")
@@ -34,24 +43,32 @@ parser.add_argument("--seg", required=True,
                     help="preprocessed segment range, e.g. 'seg5-148'; selects both the "
                          "$PREPRO_OUTPUT_DIR/{probe}_{seg} input and the {out_base}/{seg} output")
 parser.add_argument("--probe", default="ProbeB", choices=["ProbeA", "ProbeB"])
-parser.add_argument("--variant", choices=["lfp_cmr", "lfp_nocmr"],
-                    help="default: recording.variant from config/ripple.yml")
-parser.add_argument("--channel", type=int,
-                    help="detection channel index; default is the highest ripple-band power channel")
 parser.add_argument("--out-base", type=Path, default=repo_root / "data" / "derivatives")
 args = parser.parse_args()
 
 with open(repo_root / "config/ripple.yml") as f:
     cfg = yaml.safe_load(f)
 
-variant = args.variant or cfg["recording"]["variant"]
-passband = cfg["band"]["passband"]
-order = cfg["band"]["order"]
+variant = cfg["recording"]["variant"]
+passband, order = cfg["band"]["passband"], cfg["band"]["order"]
 det, nbc, cs = cfg["detection"], cfg["neighbours"], cfg["channel_selection"]
+pool = cfg["baseline"]["pool"]
 
 deriv_dir = Path(os.environ["PREPRO_OUTPUT_DIR"]) / f"{args.probe}_{args.seg}"
-out_dir = args.out_base / args.seg / args.probe / variant
+states_path = args.out_base / args.seg / args.probe / variant / "result.npz"
+sel_path = args.out_base / args.seg / args.probe / "ripples" / "channel_selection" / "channel_selection.yml"
 print(f"=== {args.probe} {variant} {args.seg} ===", flush=True)
+
+with open(sel_path) as f:
+    sel = yaml.safe_load(f)
+# A selection built against a different recording would silently put the channels of one run in the
+# table of another.
+assert sel["sources"]["states"] == str(states_path), \
+    f"channel_selection.yml was built against {sel['sources']['states']}, not {states_path}"
+selected = {int(s): int(d["channel"]) for s, d in sel["selected"].items()}
+spikiness = {int(s): float(d["spikiness"]) for s, d in sel["selected"].items()}
+print(f"channels from {sel['method']} selection: "
+      + ", ".join(f"shank {s}: ch {c}" for s, c in sorted(selected.items())), flush=True)
 
 rec = load_preprocessed(deriv_dir, variant)
 # Derivatives are saved without a probe attached, but neighbour_channels needs channel locations.
@@ -66,8 +83,7 @@ locs = rec.get_channel_locations()
 print(f"{rec.get_num_channels()} ch, {n_samples / fs / 3600:.2f} h at {fs:.0f} Hz", flush=True)
 
 # --- state masks from the scoring run ---
-result = np.load(out_dir / "result.npz")
-pool = cfg["baseline"]["pool"]
+result = np.load(states_path)
 pool_epochs = np.ones_like(result["nrem"]) if pool == "all" else result[pool]
 nrem_mask = epoch_mask_to_samples(result["times"], result["nrem"], n_samples, fs)
 baseline_mask = (nrem_mask if pool == "nrem"
@@ -76,93 +92,165 @@ nrem_s = nrem_mask.sum() / fs
 print(f"NREM {nrem_s / 3600:.2f} h ({nrem_mask.mean():.1%}); z-score baseline pool '{pool}' "
       f"({baseline_mask.mean():.1%} of samples)", flush=True)
 
-# --- detection channel: band power averaged over a sample of NREM windows ---
-if args.channel is None:
-    rng = np.random.default_rng(cs["seed"])
-    win = int(cs["window_s"] * fs)
-    nrem_t = result["times"][result["nrem"]]
-    picks = rng.choice(nrem_t[nrem_t * fs + win < n_samples],
-                       size=min(cs["n_windows"], nrem_t.size), replace=False)
-    psd_sum = None
-    for t0 in picks:
-        s0 = int(t0 * fs)
-        traces = rec.get_traces(start_frame=s0, end_frame=s0 + win).astype(np.float32)
-        freqs, psd = compute_psd(traces, fs, cs["psd_nperseg_s"])
-        psd_sum = psd if psd_sum is None else psd_sum + psd
-    power = band_power(freqs, psd_sum / len(picks), passband)
-    channel = int(np.argmax(power))
-    shank = shank_index(locs)
-    print(f"band power over {len(picks)} NREM windows -- peak channel per shank:", flush=True)
-    for s in np.unique(shank):
-        sel = np.flatnonzero(shank == s)
-        best = sel[np.argmax(power[sel])]
-        print(f"  shank {s}: ch {best} (depth {locs[best, 1]:.0f} um) power {power[best]:.4g}")
-else:
-    channel = args.channel
-    power = None
-neighbours = neighbour_channels(locs, channel)
-print(f"detection channel {channel} at {tuple(locs[channel])}; neighbours "
-      f"{ {k: v for k, v in neighbours.items()} }", flush=True)
+# --- run identity ---
+run_params = {
+    "seg": args.seg,
+    "probe": args.probe,
+    "variant": variant,
+    "band": cfg["band"],
+    "baseline_pool": pool,
+    "detection": det,
+    # n_required excluded: a post-hoc filter on n_corroborating, not a property of the run
+    "neighbours": {k: v for k, v in nbc.items() if k != "n_required"},
+    "channel_selection": {k: cs[k] for k in ("method", "n_windows", "seed", "smooth_um")},
+    # the channels themselves, not just the recipe: catches a selection rerun that changed the
+    # answer without config/ripple.yml changing
+    "channels": {int(s): int(c) for s, c in selected.items()},
+}
+run_id = hashlib.sha256(yaml.safe_dump(run_params, sort_keys=True).encode()).hexdigest()[:8]
+events_root = args.out_base / args.seg / args.probe / "ripples" / "events"
+out_dir = events_root / run_id
+if out_dir.exists():
+    print(f"run {run_id} exists -- same parameters, replacing its contents", flush=True)
+out_dir.mkdir(parents=True, exist_ok=True)
+print(f"run_id {run_id} -> {out_dir}", flush=True)
 
-# --- envelopes: one channel at a time, each is ~1e8 samples ---
+
+# --- traces: every channel we will need, read in one pass ---
+# The derivative is sample-interleaved, so pulling a single channel over the whole recording still
+# touches every page of it. Read per channel and this is 16 full passes over ~123G; read all 16
+# channels together and it is one pass, at the cost of holding them (16 x 8.0e7 float32 = 5.1G).
+shank_nb = {s: neighbour_channels(locs, selected[s]) for s in sorted(selected)}
+read_ch = sorted({c for s in shank_nb for c in (selected[s], *shank_nb[s].values())})
+col = {c: i for i, c in enumerate(read_ch)}
+print(f"reading {len(read_ch)} channels in one pass...", flush=True)
+traces = rec.get_traces(channel_ids=[rec.channel_ids[c] for c in read_ch]).astype(np.float32)
+print(f"  {traces.nbytes / 1e9:.2f} GB held", flush=True)
+
+
 def envelope_z(ch):
-    trace = rec.get_traces(channel_ids=[rec.channel_ids[ch]])[:, 0].astype(np.float64)
-    _, env = bandpass_envelope(trace, fs, passband, order, det["envelope_smooth_s"])
+    _, env = bandpass_envelope(traces[:, col[ch]].astype(np.float64), fs, passband, order,
+                               det["envelope_smooth_s"])
     return zscore_envelope(env, baseline_mask)
 
 
-print("detecting candidates...", flush=True)
-z = envelope_z(channel)
-events = detect_events(z, fs, det["boundary_sd"], det["peak_sd"], det["min_duration_s"],
+def stats(ev, iei=True):
+    n = ev["start"].size
+    out = {"n": int(n),
+           "rate_per_min_nrem": round(float(n / (nrem_s / 60)), 4) if nrem_s else None}
+    if n:
+        out["duration_ms_median"] = round(float(np.median(ev["duration_s"]) * 1000), 1)
+        out["duration_ms_iqr"] = [round(float(q * 1000), 1)
+                                  for q in np.percentile(ev["duration_s"], [25, 75])]
+        out["peak_z_median"] = round(float(np.median(ev["peak_z"])), 3)
+        if iei and n > 1:
+            out["iei_s_median"] = round(float(np.median(np.diff(ev["peak"]) / fs)), 3)
+    return out
+
+
+tables, per_shank, kept_by_shank = [], {}, {}
+for s in sorted(selected):
+    ch = selected[s]
+    nb = shank_nb[s]
+    print(f"\n--- shank {s}: ch {ch} at {locs[ch, 1]:.0f} um, neighbours "
+          f"{ {k: v for k, v in nb.items()} } ---", flush=True)
+
+    z = envelope_z(ch)
+    ev = detect_events(z, fs, det["boundary_sd"], det["peak_sd"], det["min_duration_s"],
                        det["max_duration_s"], restrict=nrem_mask,
                        min_inter_event_s=det["min_inter_event_s"])
-del z
-print(f"  {events['start'].size} candidates", flush=True)
+    del z
+    print(f"  {ev['start'].size} candidates", flush=True)
 
-# Neighbours are detected unrestricted: the NREM test belongs to the candidate, and a neighbour's
-# own peak can fall just the other side of a (several-second-fuzzy) state boundary.
-neighbour_events = []
-for name, ch in neighbours.items():
-    zn = envelope_z(ch)
-    ev = detect_events(zn, fs, nbc["boundary_sd"], nbc["peak_sd"], nbc["min_duration_s"],
-                       nbc["max_duration_s"])
-    del zn
-    neighbour_events.append(ev)
-    print(f"  neighbour {name} (ch {ch}): {ev['start'].size} events", flush=True)
+    # Neighbours are detected unrestricted: the NREM test belongs to the candidate, and a
+    # neighbour's own peak can fall just the other side of a (several-second-fuzzy) state boundary.
+    neighbour_events = []
+    for name, nch in nb.items():
+        zn = envelope_z(nch)
+        nev = detect_events(zn, fs, nbc["boundary_sd"], nbc["peak_sd"], nbc["min_duration_s"],
+                            nbc["max_duration_s"])
+        del zn
+        neighbour_events.append(nev)
+        print(f"  neighbour {name} (ch {nch}): {nev['start'].size} events", flush=True)
 
-counts = count_corroborating(events, neighbour_events, n_samples)
-events["n_corroborating"] = counts
+    ev["n_corroborating"] = count_corroborating(ev, neighbour_events, n_samples)
+    n = ev["start"].size
+    ev["shank"] = np.full(n, s, dtype=int)
+    ev["channel"] = np.full(n, ch, dtype=int)
+
+    sweep = {k: int((ev["n_corroborating"] >= k).sum()) for k in range(len(nb) + 1)}
+    keep = ev["n_corroborating"] >= nbc["n_required"]
+    kept_by_shank[s] = {k: v[keep] for k, v in ev.items()}
+    per_shank[s] = {
+        "channel": ch,
+        "depth_um": float(locs[ch, 1]),
+        "spikiness": spikiness[s],
+        "neighbours": {k: int(v) for k, v in nb.items()},
+        "n_candidates": int(n),
+        "n_corroborating_sweep": sweep,
+        "kept": stats(kept_by_shank[s]),
+    }
+    print(f"  sweep {sweep}; kept {int(keep.sum())} at n_required={nbc['n_required']}", flush=True)
+    tables.append(ev)
+
+events = {k: np.concatenate([t[k] for t in tables]) for k in tables[0]}
 for key in ("start", "end", "peak"):
     events[f"{key}_s"] = events[key] / fs
 
-# --- summary ---
-sweep = {k: int((counts >= k).sum()) for k in range(len(neighbours) + 1)}
-keep = counts >= nbc["n_required"]
-kept = {k: v[keep] for k, v in events.items()}
-iei = np.diff(kept["peak_s"])
+# --- cross-shank coincidence of kept events ---
+# Asymmetric by construction: rows are the fraction of THAT shank's events with an overlapping
+# event on the column's shank, and the two shanks have different event counts. A ripple field is
+# local to a shank, so high off-diagonal values are the signature of something volume-conducted or
+# shared by reference rather than of a common ripple.
+coincidence = {}
+for a in sorted(kept_by_shank):
+    row = {}
+    for b in sorted(kept_by_shank):
+        if a == b or kept_by_shank[a]["start"].size == 0:
+            continue
+        frac = count_corroborating(kept_by_shank[a], [kept_by_shank[b]], n_samples).mean()
+        row[int(b)] = round(float(frac), 4)
+    coincidence[int(a)] = row
+print("\n--- cross-shank coincidence (fraction of row's events seen on column) ---", flush=True)
+for a, row in coincidence.items():
+    print(f"  shank {a}: " + "  ".join(f"{b}:{v:.3f}" for b, v in row.items()), flush=True)
+
+# IEI is omitted from the combined stats: the table is shanks concatenated, so a difference of
+# consecutive peaks crosses shank boundaries and means nothing.
+kept_all = {k: v[events["n_corroborating"] >= nbc["n_required"]] for k, v in events.items()}
 summary = {
     "n_candidates": int(events["start"].size),
     "n_required": nbc["n_required"],
-    "n_kept": int(keep.sum()),
     "nrem_hours": round(float(nrem_s / 3600), 3),
-    "rate_per_min_nrem": round(float(keep.sum() / (nrem_s / 60)), 4) if nrem_s else None,
-    "duration_ms_median": round(float(np.median(kept["duration_s"]) * 1000), 1) if keep.any() else None,
-    "duration_ms_iqr": [round(float(q * 1000), 1) for q in np.percentile(kept["duration_s"], [25, 75])]
-                       if keep.any() else None,
-    "peak_z_median": round(float(np.median(kept["peak_z"])), 3) if keep.any() else None,
-    "iei_s_median": round(float(np.median(iei)), 3) if iei.size else None,
-    "n_corroborating_sweep": sweep,
+    "kept": stats(kept_all, iei=False),
 }
-print(yaml.safe_dump(summary, sort_keys=False), flush=True)
+print("\n" + yaml.safe_dump(summary, sort_keys=False), flush=True)
 
-np.savez(out_dir / "ripples.npz", **events)
-with open(out_dir / "ripples.yml", "w") as f:
+np.savez(out_dir / "events.npz", **events)
+with open(out_dir / "events.yml", "w") as f:
     yaml.safe_dump({
+        "run_id": run_id,
+        "created": datetime.now().isoformat(timespec="seconds"),
+        "run_params": run_params,
         "ripple_config": cfg,
-        "sources": {"lfp": str(deriv_dir), "variant": variant, "states": str(out_dir / "result.npz")},
-        "channel": channel,
-        "channel_depth_um": float(locs[channel, 1]),
-        "neighbours": {k: int(v) for k, v in neighbours.items()},
+        "sources": {"lfp": str(deriv_dir), "states": str(states_path),
+                    "channel_selection": str(sel_path)},
+        "per_shank": per_shank,
+        "cross_shank_coincidence": coincidence,
         "summary": summary,
     }, f, sort_keys=False)
-print(f"saved -> {out_dir / 'ripples.npz'} (all candidates, filter on n_corroborating)")
+
+runs_path = events_root / "runs.yml"
+runs = yaml.safe_load(runs_path.read_text()) if runs_path.exists() else {}
+runs[run_id] = {
+    "created": datetime.now().isoformat(timespec="seconds"),
+    "run_params": run_params,
+    "n_candidates": summary["n_candidates"],
+    "n_required": nbc["n_required"],
+    "n_kept": summary["kept"]["n"],
+    "rate_per_min_nrem": {s: v["kept"]["rate_per_min_nrem"] for s, v in per_shank.items()},
+}
+with open(runs_path, "w") as f:
+    yaml.safe_dump(runs, f, sort_keys=False)
+print(f"saved -> {out_dir / 'events.npz'} (all candidates, filter on n_corroborating)")
+print(f"indexed -> {runs_path} ({len(runs)} runs)")
