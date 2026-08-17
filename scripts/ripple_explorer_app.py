@@ -17,8 +17,8 @@ from dotenv import load_dotenv
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 from sleep_sandbox.ripple import (load_recording, compute_psd, band_power,
-                                  shank_index, pick_channels_per_shank,
-                                  bandpass_envelope, detect_events, peri_event_trace)
+                                  shank_index, pick_channels_per_shank, bandpass_envelope,
+                                  zscore_envelope, detect_events, peri_event_trace)
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(REPO_ROOT / ".env")
@@ -131,15 +131,17 @@ with c2:
 # --- envelope + detection on selected channel ---
 trace = traces[:, channel]
 filtered, envelope = bandpass_envelope(trace, fs, passband, order=filter_order)
-events, z = detect_events(envelope, fs, boundary_sd, peak_sd, dur_min / 1000, dur_max / 1000)
+z = zscore_envelope(envelope)
+events = detect_events(z, fs, boundary_sd, peak_sd, dur_min / 1000, dur_max / 1000)
+n_events = events["start"].size
 n_show = min(int(min(env_plot_s, t_dur) * fs), len(z))
 t_axis = np.arange(n_show) / fs
 
-st.subheader(f"Channel {channel} — {len(events)} events  ·  boundary {boundary_sd:g} SD, peak {peak_sd:g} SD")
+st.subheader(f"Channel {channel} — {n_events} events  ·  boundary {boundary_sd:g} SD, peak {peak_sd:g} SD")
 
 thr_z = np.where(z > boundary_sd, z, 0.0)
 valid_z = np.zeros_like(z)
-for s, e in events:
+for s, e in zip(events["start"], events["end"]):
     valid_z[s:e] = z[s:e]
 
 for title, y in [("Envelope (z-scored)", z),
@@ -162,21 +164,21 @@ def _step_event(delta, n):
 
 
 st.subheader("Event browser")
-if len(events) == 0:
+if n_events == 0:
     st.info("No events detected with current parameters.")
 else:
     st.session_state.setdefault("event_idx", 0)
-    st.session_state.event_idx = min(st.session_state.event_idx, len(events) - 1)
+    st.session_state.event_idx = min(st.session_state.event_idx, n_events - 1)
     c_prev, c_next, c_slider = st.columns([1, 1, 6])
-    c_prev.button("◀ Prev", on_click=_step_event, args=(-1, len(events)), use_container_width=True)
-    c_next.button("Next ▶", on_click=_step_event, args=(1, len(events)), use_container_width=True)
-    if len(events) > 1:
-        c_slider.slider("Event index", 0, len(events) - 1, key="event_idx")
+    c_prev.button("◀ Prev", on_click=_step_event, args=(-1, n_events), use_container_width=True)
+    c_next.button("Next ▶", on_click=_step_event, args=(1, n_events), use_container_width=True)
+    if n_events > 1:
+        c_slider.slider("Event index", 0, n_events - 1, key="event_idx")
     idx = st.session_state.event_idx
-    s, e = events[idx]
+    s, e = events["start"][idx], events["end"][idx]
 
-    t_ev, seg = peri_event_trace(trace, events[idx], fs, event_window_s)
-    _, seg_filt = peri_event_trace(filtered, events[idx], fs, event_window_s)
+    t_ev, seg = peri_event_trace(trace, (s, e), fs, event_window_s)
+    _, seg_filt = peri_event_trace(filtered, (s, e), fs, event_window_s)
     df = pd.DataFrame({"time_s": t_ev, "raw": seg, "filtered": seg_filt})
     raw_line = alt.Chart(df).mark_line(strokeWidth=0.7, color="#4C78A8").encode(
         x=alt.X("time_s:Q", title="Time (s)"),
@@ -187,6 +189,6 @@ else:
     start = alt.Chart(pd.DataFrame({"t": [s / fs]})).mark_rule(color="green", size=2).encode(x="t:Q")
     end = alt.Chart(pd.DataFrame({"t": [e / fs]})).mark_rule(color="red", size=2).encode(x="t:Q")
     chart = alt.layer(raw_line, filt_line, start, end).resolve_scale(y="independent").interactive(
-        bind_y=False).properties(title=f"Event {idx} / {len(events) - 1} — {(e - s) / fs * 1000:.0f} ms", height=350)
+        bind_y=False).properties(title=f"Event {idx} / {n_events - 1} — {(e - s) / fs * 1000:.0f} ms", height=350)
     st.altair_chart(chart, use_container_width=True)
     st.caption("🔵 raw LFP (left axis)  ·  🟠 bandpass-filtered (right axis)  ·  🟢 start  🔴 end  ·  drag/scroll = pan/zoom (x)")
