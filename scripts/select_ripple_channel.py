@@ -22,14 +22,12 @@ from pathlib import Path
 
 import numpy as np
 import yaml
-import matplotlib
-matplotlib.use("Agg")
-import matplotlib.pyplot as plt
 from dotenv import load_dotenv
 from probeinterface import read_probeinterface
 
 from sleep_sandbox.io import load_preprocessed, find_amplifier_files
 from sleep_sandbox.ripple import compute_psd, shank_index, channel_scores, select_channels
+from plot_ripple_channel import METHODS, make_figures
 
 repo_root = Path(__file__).resolve().parent.parent
 load_dotenv(repo_root / ".env")
@@ -45,7 +43,6 @@ with open(repo_root / "config/ripple.yml") as f:
 variant = cfg["recording"]["variant"]
 cs = cfg["channel_selection"]
 passband, delta_band = cfg["band"]["passband"], cs["delta_band"]
-METHODS = ["raw", "smoothed", "delta_ratio"]
 
 sweep_n = sorted(cs["sweep"]["n_windows"])
 seeds = cs["sweep"]["seeds"]
@@ -152,86 +149,8 @@ with open(out_dir / "channel_selection.yml", "w") as f:
     }, f, sort_keys=False)
 
 # --- figures ---
-def _mark(ax, ch, color="red"):
-    ax.axhline(locs[ch, 1], color=color, ls="--", lw=0.8)
-
-
-fig, axes = plt.subplots(len(shanks), 3, figsize=(13, 3.2 * len(shanks)), sharey="row", squeeze=False)
-for r, s in enumerate(shanks):
-    sel = np.flatnonzero(shank == s)
-    y = locs[sel, 1]
-    for c, (key, label) in enumerate([("raw", f"{passband[0]}-{passband[1]} Hz power"),
-                                      ("smoothed", f"depth-smoothed (+/-{cs['smooth_um']:.0f} um)"),
-                                      ("delta_ratio", f"ripple / delta {delta_band}")]):
-        ax = axes[r, c]
-        ax.plot(scores[key][sel], y, ".-", ms=3, lw=0.6)
-        if key == "smoothed":
-            ax.plot(scores["raw"][sel], y, ".", ms=2, color="grey", alpha=0.5, label="raw")
-            ax.legend(fontsize=6)
-        _mark(ax, select_channels(scores, locs, key)[int(s)])
-        ax.set_xlabel(label, fontsize=8)
-        if c == 0:
-            ax.set_ylabel(f"shank {s}\ndepth (um)")
-fig.suptitle(f"{args.probe} {args.seg} — channel scores by depth (dashed = that score's pick)")
-fig.tight_layout()
-fig.savefig(out_dir / "depth_profiles.png", dpi=150)
-plt.close(fig)
-
-fmask = (freqs >= 0.25) & (freqs <= 300)
-fig, ax = plt.subplots(figsize=(8, 5))
-for s, ch in selected.items():
-    ax.semilogy(freqs[fmask], prod_psd[fmask, ch], lw=0.9, label=f"shank {s} — ch {ch} ({locs[ch, 1]:.0f} um)")
-ax.axvspan(*passband, color="grey", alpha=0.2)
-ax.axvspan(*delta_band, color="steelblue", alpha=0.15)
-ax.set_xlabel("Frequency (Hz)")
-ax.set_ylabel("PSD (NREM mean)")
-ax.set_title("Selected channel per shank — a real ripple channel shows a bump in the shaded band")
-ax.legend(fontsize=7)
-fig.tight_layout()
-fig.savefig(out_dir / "psd_selected.png", dpi=150)
-plt.close(fig)
-
-fig, axes = plt.subplots(len(shanks), len(METHODS), figsize=(4 * len(METHODS), 2.8 * len(shanks)),
-                         sharex=True, sharey="row", squeeze=False)
-for r, s in enumerate(shanks):
-    for c, method in enumerate(METHODS):
-        ax = axes[r, c]
-        for seed in seeds:
-            m = ((sweep_rec["method"] == method) & (sweep_rec["shank"] == s)
-                 & (sweep_rec["seed"] == seed))
-            o = np.argsort(sweep_rec["n_windows"][m])
-            ax.plot(sweep_rec["n_windows"][m][o], sweep_rec["depth_um"][m][o],
-                    "o-", ms=4, lw=0.7, alpha=0.7, label=f"seed {seed}" if r == 0 and c == 0 else None)
-        ax.set_xscale("log")
-        ax.set_xticks(sweep_n)
-        ax.set_xticklabels(sweep_n)
-        if r == 0:
-            ax.set_title(method, fontsize=9)
-        if c == 0:
-            ax.set_ylabel(f"shank {s}\nselected depth (um)")
-        if r == len(shanks) - 1:
-            ax.set_xlabel("n windows (10 s each)")
-axes[0, 0].legend(fontsize=6)
-fig.suptitle(f"{args.probe} {args.seg} — selection stability: flat lines = converged")
-fig.tight_layout()
-fig.savefig(out_dir / "window_sweep.png", dpi=150)
-plt.close(fig)
-
-fig, axes = plt.subplots(1, len(shanks), figsize=(3.2 * len(shanks), 5), sharey=True, squeeze=False)
-for c, s in enumerate(shanks):
-    sel = np.flatnonzero(shank == s)
-    ax = axes[0, c]
-    ax.plot(scores["spikiness"][sel], locs[sel, 1], ".", ms=3)
-    ax.axvline(1.0, color="grey", lw=0.6)
-    ax.axvline(2.0, color="red", ls="--", lw=0.8)
-    _mark(ax, selected[int(s)])
-    ax.set_xlabel("raw / smoothed")
-    ax.set_title(f"shank {s}", fontsize=9)
-    if c == 0:
-        ax.set_ylabel("depth (um)")
-fig.suptitle("Spikiness — isolated peaks (>2, red) are single-contact artefacts, not ripple fields")
-fig.tight_layout()
-fig.savefig(out_dir / "spikiness.png", dpi=150)
-plt.close(fig)
+# Plotting lives in plot_ripple_channel.py so the figures can be regenerated from the arrays above
+# without repeating the window reads, with one copy of the code either way.
+make_figures(out_dir, f"{args.probe} {args.seg}")
 
 print(f"\nsaved -> {out_dir}", flush=True)
