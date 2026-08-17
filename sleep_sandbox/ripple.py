@@ -65,6 +65,44 @@ def pick_channels_per_shank(power, shank, n_per_shank=1):
     return picks
 
 
+def smooth_depth_profile(power, locations, smooth_um=50.0):
+    """Depth-smooth a per-channel profile within each shank: each channel becomes the MEDIAN over
+    the channels within +/-smooth_um of its own depth on the same shank. Median, not mean: a
+    ~15 um row pitch puts only a handful of channels in the window, and a mean lets one badly
+    elevated contact carry its own neighbourhood and still win the argmax. The median ignores it
+    outright, while a genuine ripple field -- which elevates every channel in the window -- still
+    raises it."""
+    shank = shank_index(locations)
+    out = np.empty(power.shape, dtype=float)
+    for s in np.unique(shank):
+        sel = np.flatnonzero(shank == s)
+        y = locations[sel, 1]
+        for i, ch in enumerate(sel):
+            out[ch] = np.median(power[sel[np.abs(y - y[i]) <= smooth_um]])
+    return out
+
+
+def channel_scores(freqs, psd, locations, passband, delta_band, smooth_um=50.0):
+    """Three per-channel scores for 'is this the ripple channel'. 'raw' is band power, which a
+    single noisy contact can win outright. 'smoothed' depth-smooths it, so a contact only wins if
+    its neighbours are elevated too -- which is true of a ripple field (spreads ~100-200 um) and
+    false of a bad contact. 'delta_ratio' divides by delta power, cancelling per-channel gain and
+    broadband noise, at the cost of importing the depth profile of delta itself."""
+    raw = band_power(freqs, psd, passband)
+    delta = band_power(freqs, psd, delta_band)
+    smoothed = smooth_depth_profile(raw, locations, smooth_um)
+    return {"raw": raw, "smoothed": smoothed, "delta": delta, "delta_ratio": raw / delta,
+            "spikiness": raw / smoothed}
+
+
+def select_channels(scores, locations, method):
+    """Highest-scoring channel on each shank under `method`. Returns {shank: channel}."""
+    shank = shank_index(locations)
+    score = scores[method]
+    return {int(s): int(np.flatnonzero(shank == s)[np.argmax(score[shank == s])])
+            for s in np.unique(shank)}
+
+
 def neighbour_channels(locations, channel):
     """The above/below/lateral neighbours of `channel` on its own shank: the next contact up and
     the next down its own column, plus the nearest contact in the other column. Neighbours that
@@ -92,8 +130,12 @@ def bandpass_envelope(trace, fs, passband, order=4, smooth_s=0.0):
     sos = butter(order, passband, btype="bandpass", fs=fs, output="sos")
     filtered = sosfiltfilt(sos, trace)
     # hilbert FFTs at len(trace); a 22 h recording is ~1e8 samples of arbitrary length, which drops
-    # scipy into Bluestein's algorithm. Zero-pad to the next fast length and truncate back -- the
-    # only cost is a padding edge effect in the final samples.
+    # scipy into Bluestein's algorithm (measured 5.3x slower on a prime length, plus the extra
+    # length-2N workspace). Zero-pad to the next fast length and truncate back. This is not the
+    # identical answer -- the Hilbert kernel is long-range, so padding perturbs the envelope
+    # everywhere, not just at the tail -- but measured on a bandpassed trace only 13 samples in
+    # 1e7 move by more than 1% of the envelope median, and detected events are unchanged
+    # (identical starts/ends/peaks, peak_z within 1e-5).
     envelope = np.abs(hilbert(filtered, next_fast_len(filtered.size)))[:filtered.size]
     if smooth_s > 0:
         n = max(int(smooth_s * fs), 1)
