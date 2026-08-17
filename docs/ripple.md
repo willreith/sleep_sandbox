@@ -92,10 +92,14 @@ Two consequences to keep in mind:
 
 ## Decisions taken (2026-08-17)
 
-- **Referencing: `lfp_cmr`.** Not inherited from the scoring track's decision — slow-wave went
+- **Referencing: `lfp_cmr` only.** Not inherited from the scoring track's decision — slow-wave went
   noCMR because the global median removes the synchronous signal PC1 is built to detect
   (`sleep_classification_algorithm.md`, "Note on referencing"). That argument does not transfer to
-  ripples, which are local. noCMR is retained as the control.
+  ripples, which are local. **noCMR is not detected on at all**, so the drivers carry no `--variant`
+  flag; `recording.variant` in the config is the record of which derivative was used. This also
+  removes a confound that would otherwise have bitten: channel selection run independently per
+  variant can pick different channels, so a cmr-vs-nocmr comparison would have varied referencing
+  and channel at once.
 - **Strict neighbour criteria, separately parameterised.** A neighbour corroborates only if it has
   its own fully-qualified event (peak ≥ its own `peak_sd`, duration in range) overlapping the
   candidate in time. But the `neighbours:` block in `config/ripple.yml` carries its own
@@ -197,13 +201,29 @@ Baseline-pool variation is deferred; NREM-only first.
 
 ## Outputs
 
-`scripts/run_ripples.py --seg seg5-148 [--probe ProbeB] [--variant lfp_cmr] [--channel N]` writes
-into `{out_base}/{seg}/{probe}/{variant}/`, alongside the scoring track's `result.npz`:
+Ripple derivatives live in a **`ripples/` dir that is a sibling of the sleep-classification variant
+dirs**, not a child of one — the two tracks stay visibly separate, and the variant level is dead
+weight now that only CMR is detected on:
 
-- **`ripples.npz`** — the event table: `start`/`end`/`peak` (samples), `start_s`/`end_s`/`peak_s`,
-  `peak_z`, `duration_s`, `n_corroborating`.
-- **`ripples.yml`** — the config used, source paths, detection channel + depth, the three neighbour
-  channel indices, and the summary statistics.
+```
+data/derivatives/{seg}/{probe}/
+  lfp_cmr/ lfp_nocmr/          <- sleep classification, unchanged
+  ripples/
+    channel_selection/
+      channel_selection.yml    # chosen channel per shank, all three scores, consistency, provenance
+      profiles.npz             # freqs, mean NREM psd, per-channel scores, locations, shank
+      window_sweep.npz         # selected channel + depth per (n_windows, seed, shank, method)
+      depth_profiles.png  psd_selected.png  window_sweep.png  spikiness.png
+    events/
+      events.npz               # one table, shank + channel columns, ALL candidates
+      events.yml               # config, sources, per-shank summary, corroboration sweep
+```
+
+The cross-track dependency — the NREM mask comes from `{variant}/result.npz` — is recorded in each
+sidecar's `sources` block, so the coupling is explicit rather than hidden in a path convention.
+
+The event table holds `start`/`end`/`peak` (samples), `start_s`/`end_s`/`peak_s`, `peak_z`,
+`duration_s`, `n_corroborating`, `shank`, `channel`.
 
 **Every candidate is saved, filtered by nothing but the NREM restriction.** `n_required` is applied
 only to compute the summary, and the run prints the full k = 0..3 sweep. So the headline sensitivity
@@ -216,15 +236,63 @@ The driver requires `run_scoring.py` to have run for the same seg/probe/variant 
 NREM mask comes from. It re-attaches the probe via `find_amplifier_files` (the same discovery
 `run_scoring.py` uses), so the geometry matches what the derivatives were built with.
 
-### Two implementation notes
-
-- **Detection channel** defaults to the globally highest ripple-band-power channel, with band power
-  averaged over a random sample of NREM windows (`channel_selection` in the config) because a PSD
-  over the full recording is infeasible. The per-shank ranking is printed so the choice can be
-  sanity-checked, and `--channel` overrides it.
 - **Neighbours are detected without the NREM restriction.** The NREM test belongs to the candidate;
   a neighbour's own peak can legitimately fall the other side of a state boundary that is only
   accurate to a few seconds.
+
+## Channel selection
+
+`scripts/select_ripple_channel.py` (sbatch: `submit_ripple_channel.sh`) picks **one channel per
+shank** and measures how stable that choice is. Detection then runs on all shanks, which also sets
+up the later cross-shank event-coincidence check.
+
+Band power is averaged over a random sample of 10 s NREM windows — a PSD over the full 22 h would
+need ~152 GB of reads. Three scores are computed every run (`ripple.channel_scores`); the
+`channel_selection.method` key decides which one selects.
+
+| Score | Definition | Rejects |
+|---|---|---|
+| `raw` | ripple-band power | nothing — a single bad contact wins outright |
+| `smoothed` | **median** of `raw` over channels within ±`smooth_um` on the same shank | single-contact artefacts |
+| `delta_ratio` | ripple power / delta power | per-channel gain, impedance, broadband noise |
+
+**Why the median and not a mean.** The discriminator is spatial *width*, not peak height: a ripple
+field spreads ~100–200 µm so its neighbours are elevated too, whereas a bad contact is a delta spike
+against flat neighbours. But at 15 µm row pitch a ±50 µm window holds only ~14 channels, and a mean
+lets one 25×-elevated contact carry its own neighbourhood and still win the argmax — this was
+caught on synthetic data, where the mean version failed. The median ignores the outlier entirely.
+Cost: the median biases the located peak slightly (20 µm vs 5 µm error on synthetic data), which is
+well inside the field width.
+
+`spikiness = raw / smoothed` is reported per channel; on synthetic data planted bad contacts score
+21–25 against 1.0 for clean channels, so the >2 flag in the diagnostics is well clear of noise.
+
+**`delta_ratio` is not a clean noise control.** Delta power varies with layer, so the ratio carries
+anatomy as well as noise. It looks best on synthetic data only because the synthetic bad contact is
+perfectly broadband and the synthetic delta profile is flat — neither holds in vivo. That is what
+the diagnostic figures are for.
+
+### Stability sweep
+
+Nested draws: the n=10 sample is a prefix of n=50 ⊂ n=100 ⊂ n=200, so differences across n are
+"more data", never "different data". Five seeds per size.
+
+Consistency is reported as the **spread in µm of the selected depth across seeds**, not an
+exact-match rate — two contacts 15 µm apart are the same anatomical choice, so exact match would
+understate agreement.
+
+**The null signature:** on a shank with no ripple field the profile is flat and the argmax is
+arbitrary, so the pick jumps around across seeds and never converges with n. ProbeA is run as
+exactly this negative control.
+
+### Diagnostic figures
+
+| Figure | Shows |
+|---|---|
+| `depth_profiles.png` | Per shank: raw, smoothed and delta-ratio vs depth, each score's pick marked |
+| `psd_selected.png` | PSD of each shank's pick, ripple and delta bands shaded. **The decisive check** — a real ripple channel shows a bump in the ripple band; a noise channel is a featureless scaled-up spectrum |
+| `window_sweep.png` | Selected depth vs n windows, per shank × method, one line per seed. Flat = converged |
+| `spikiness.png` | raw/smoothed vs depth, >2 flagged as single-contact artefact |
 
 ## References
 
