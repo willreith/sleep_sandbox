@@ -1,0 +1,39 @@
+# Ripple-detection parameters (Zhang et al., PNAS, 2021). The recording/filter parameters for the
+# LFP this runs on live in config/preprocessing.yml. See docs/ripple.md.
+
+recording:
+  variant: lfp_cmr        # ripples run on the CMR'd LFP; lfp_nocmr is the control
+
+band:
+  passband: [140, 250]    # Hz
+  order: 4                # Butterworth. Note scipy's butter(4, ..., 'bandpass') is already 8-pole,
+                          # and sosfiltfilt applies it twice again for zero phase.
+
+baseline:
+  pool: nrem              # samples the z-score mean/SD is estimated on: nrem | wake | all.
+                          # NREM-only for now; widening it is a planned sensitivity test.
+
+detection:                # candidate events on the peak-ripple-power channel
+  boundary_sd: 2.0        # event extent
+  peak_sd: 5.0            # event must reach this
+  min_duration_s: 0.030
+  max_duration_s: 0.200
+  min_inter_event_s: 0.0  # merge events closer than this. 0 = off, which reproduces Zhang; the
+                          # buzcode/FMAToolbox default is 0.030. See docs/ripple.md, "Event merging".
+  envelope_smooth_s: 0.0  # moving-average the envelope before thresholding; 0 = off
+
+neighbours:               # automated stand-in for Zhang's manual curation. The three neighbours are
+                          # the contacts above, below and lateral on the same shank.
+  n_required: 0           # how many of the three must corroborate; 0 = no corroboration.
+                          # Swept 0-3 as the headline sensitivity test.
+  boundary_sd: 2.0        # deliberately separate from `detection` above, so the bar a neighbour
+  peak_sd: 5.0            # must clear can be relaxed without moving the candidate-detection bar
+  min_duration_s: 0.030
+  max_duration_s: 0.200
+
+channel_selection:                # a PSD over the whole 22 h recording is infeasible, so band power
+                                  # per channel is averaged over a sample of NREM windows
+  psd_nperseg_s: 2.0
+  window_s: 10.0
+  n_windows: 20
+  seed: 0
