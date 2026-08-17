@@ -2,7 +2,9 @@
 # LFP this runs on live in config/preprocessing.yml. See docs/ripple.md.
 
 recording:
-  variant: lfp_cmr        # ripples run on the CMR'd LFP; lfp_nocmr is the control
+  variant: lfp_cmr        # ripples run on the CMR'd LFP only. noCMR is not detected on at all, so
+                          # there is no variant flag on the drivers -- this key is the record of
+                          # which derivative the results came from.
 
 band:
   passband: [140, 250]    # Hz
@@ -33,7 +35,22 @@ neighbours:               # automated stand-in for Zhang's manual curation. The 
 
 channel_selection:                # a PSD over the whole 22 h recording is infeasible, so band power
                                   # per channel is averaged over a sample of NREM windows
-  psd_nperseg_s: 2.0
+  method: smoothed                # which score selects: raw | smoothed | delta_ratio (all three are
+                                  # always computed and plotted). 'smoothed' targets the actual
+                                  # failure mode -- a single noisy contact winning on absolute power.
+  psd_nperseg_s: 4.0              # 0.25 Hz resolution. Was 2.0; too coarse for the 0.5-4 Hz delta
+                                  # band, which got ~7 bins.
   window_s: 10.0
-  n_windows: 20
+  n_windows: 200                  # windows behind the production selection, drawn with `seed`
   seed: 0
+  smooth_um: 50.0                 # depth-smoothing half-width for the 'smoothed' score. A ripple
+                                  # field spreads ~100-200 um so its neighbours are elevated too; a
+                                  # bad contact is a delta spike against flat neighbours. Smoothing
+                                  # the depth profile before argmax is what separates them.
+  delta_band: [0.5, 4.0]          # denominator for 'delta_ratio'. Cancels per-channel gain and
+                                  # broadband-noise differences, but delta power is NOT flat across
+                                  # depth, so this ratio carries layer anatomy as well as noise.
+  sweep:                          # consistency diagnostic, not used for the production selection
+    n_windows: [10, 50, 100, 200] # nested: the n=10 draw is a prefix of n=50, etc., so differences
+                                  # across n are 'more data', never 'different data'
+    seeds: [0, 1, 2, 3, 4]
