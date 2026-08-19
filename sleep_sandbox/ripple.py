@@ -194,6 +194,39 @@ def detect_events(z, fs, boundary_sd, peak_sd, min_duration_s, max_duration_s,
             "peak_z": z[peak][ok], "duration_s": duration_s[ok]}
 
 
+def event_spectral_stats(trace, peaks, fs, window_s, nfft, search_band, background_band):
+    """Per event, the dominant frequency in search_band and how far its peak stands above the 1/f
+    background, both from one Hann-tapered window centred on the event peak.
+
+    `trace` must be the WIDEBAND LFP, not the bandpassed one: a spectrum of the filtered trace can
+    only peak inside the passband, so it would answer its own question. A true ripple puts its
+    argmax at 140-200 Hz; a broadband transient that merely rings through the filter has no peak
+    there and its argmax wanders, usually to the bottom of search_band.
+
+    `prominence` is peak power over a log-log line fitted across background_band and extrapolated
+    to the peak: ~1 for a plain 1/f decay with no oscillation, >1 for a genuine narrowband peak.
+    It asks whether a peak exists at all, which peak_hz alone cannot. Normalising against each
+    event's own background is what makes it comparable between regions whose spectra have
+    different slopes; a raw power ratio is not. background_band must stay BELOW the passband --
+    the LFP was lowpassed at 300 Hz, so an upper flank would measure filter roll-off."""
+    n = int(window_s * fs)
+    win = np.hanning(n)
+    freqs = np.fft.rfftfreq(nfft, 1 / fs)
+    sel = np.flatnonzero((freqs >= search_band[0]) & (freqs <= search_band[1]))
+    bg = np.flatnonzero((freqs >= background_band[0]) & (freqs <= background_band[1]))
+    log_bg = np.log10(freqs[bg])
+    peak_hz, prominence = np.empty(peaks.size), np.empty(peaks.size)
+    for i, p in enumerate(peaks):
+        hi = min(int(p) + n // 2, trace.size)
+        seg = trace[max(hi - n, 0):hi]
+        spec = np.abs(np.fft.rfft((seg - seg.mean()) * win[:seg.size], nfft)) ** 2
+        j = sel[np.argmax(spec[sel])]
+        peak_hz[i] = freqs[j]
+        fit = np.polyfit(log_bg, np.log10(spec[bg]), 1)
+        prominence[i] = spec[j] / 10 ** np.polyval(fit, np.log10(freqs[j]))
+    return {"peak_hz": peak_hz, "prominence": prominence}
+
+
 def count_corroborating(events, neighbour_events, n_samples):
     """Per event in `events`, how many of the `neighbour_events` event dicts have an event
     overlapping it in time. Neighbours are detected separately, so their criteria are independent

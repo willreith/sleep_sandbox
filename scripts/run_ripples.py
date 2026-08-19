@@ -21,6 +21,7 @@ rerun, and hashing it would split byte-identical outputs across directories.
 """
 
 import os
+import time
 import argparse
 import hashlib
 from datetime import datetime
@@ -33,7 +34,8 @@ from probeinterface import read_probeinterface
 
 from sleep_sandbox.io import load_preprocessed, find_amplifier_files
 from sleep_sandbox.ripple import (neighbour_channels, bandpass_envelope, zscore_envelope,
-                                  epoch_mask_to_samples, detect_events, count_corroborating)
+                                  epoch_mask_to_samples, detect_events, count_corroborating,
+                                  event_spectral_stats)
 
 repo_root = Path(__file__).resolve().parent.parent
 load_dotenv(repo_root / ".env")
@@ -51,7 +53,7 @@ with open(repo_root / "config/ripple.yml") as f:
 
 variant = cfg["recording"]["variant"]
 passband, order = cfg["band"]["passband"], cfg["band"]["order"]
-det, nbc, cs = cfg["detection"], cfg["neighbours"], cfg["channel_selection"]
+det, nbc, cs, spec = cfg["detection"], cfg["neighbours"], cfg["channel_selection"], cfg["spectrum"]
 pool = cfg["baseline"]["pool"]
 
 deriv_dir = Path(os.environ["PREPRO_OUTPUT_DIR"]) / f"{args.probe}_{args.seg}"
@@ -116,16 +118,29 @@ out_dir.mkdir(parents=True, exist_ok=True)
 print(f"run_id {run_id} -> {out_dir}", flush=True)
 
 
-# --- traces: every channel we will need, read in one pass ---
+# --- traces: every channel we will need, read in one chunked pass ---
 # The derivative is sample-interleaved, so pulling a single channel over the whole recording still
-# touches every page of it. Read per channel and this is 16 full passes over ~123G; read all 16
-# channels together and it is one pass, at the cost of holding them (16 x 8.0e7 float32 = 5.1G).
+# touches every page of it -- reading per channel would be one full pass over the 83G file each
+# time. So read every channel we need together, but do it in time chunks rather than one call:
+# one call fancy-indexes a memmap spanning the whole file, and under a SLURM memory cgroup the
+# page cache that pulls in is charged to the job, so it hits the cap and thrashes instead of
+# finishing (measured: 3 h without completing the read, MaxRSS pinned at the 24G limit). Chunked,
+# each slab is contiguous, its page cache is reclaimable, and a full pass takes ~2.3 min.
 shank_nb = {s: neighbour_channels(locs, selected[s]) for s in sorted(selected)}
 read_ch = sorted({c for s in shank_nb for c in (selected[s], *shank_nb[s].values())})
 col = {c: i for i, c in enumerate(read_ch)}
-print(f"reading {len(read_ch)} channels in one pass...", flush=True)
-traces = rec.get_traces(channel_ids=[rec.channel_ids[c] for c in read_ch]).astype(np.float32)
-print(f"  {traces.nbytes / 1e9:.2f} GB held", flush=True)
+chunk = int(300 * fs)
+traces = np.empty((n_samples, len(read_ch)), dtype=rec.get_dtype())
+print(f"reading {len(read_ch)} channels in {-(-n_samples // chunk)} chunks "
+      f"({traces.nbytes / 1e9:.2f} GB held as {traces.dtype})...", flush=True)
+t_read = time.time()
+ids = [rec.channel_ids[c] for c in read_ch]
+for i, s0 in enumerate(range(0, n_samples, chunk)):
+    s1 = min(s0 + chunk, n_samples)
+    traces[s0:s1] = rec.get_traces(start_frame=s0, end_frame=s1, channel_ids=ids)
+    if i % 50 == 0:
+        print(f"  {s1 / n_samples:.0%} ({time.time() - t_read:.0f}s)", flush=True)
+print(f"  read in {time.time() - t_read:.0f}s", flush=True)
 
 
 def envelope_z(ch):
@@ -143,6 +158,11 @@ def stats(ev, iei=True):
         out["duration_ms_iqr"] = [round(float(q * 1000), 1)
                                   for q in np.percentile(ev["duration_s"], [25, 75])]
         out["peak_z_median"] = round(float(np.median(ev["peak_z"])), 3)
+        out["peak_hz_median"] = round(float(np.median(ev["peak_hz"])), 1)
+        out["frac_peak_hz_in_band"] = round(float(np.mean((ev["peak_hz"] >= passband[0])
+                                                          & (ev["peak_hz"] <= passband[1]))), 3)
+        out["prominence_median"] = round(float(np.median(ev["prominence"])), 2)
+        out["frac_prominence_gt2"] = round(float(np.mean(ev["prominence"] > 2)), 3)
         if iei and n > 1:
             out["iei_s_median"] = round(float(np.median(np.diff(ev["peak"]) / fs)), 3)
     return out
@@ -174,6 +194,11 @@ for s in sorted(selected):
         print(f"  neighbour {name} (ch {nch}): {nev['start'].size} events", flush=True)
 
     ev["n_corroborating"] = count_corroborating(ev, neighbour_events, n_samples)
+    # Wideband, not the bandpassed trace -- see event_peak_frequency. An event whose argmax sits at
+    # the search-band floor has no spectral peak at all, which is the transient signature.
+    ev.update(event_spectral_stats(traces[:, col[ch]].astype(np.float64), ev["peak"], fs,
+                                   spec["window_s"], spec["nfft"], spec["search_band"],
+                                   spec["background_band"]))
     n = ev["start"].size
     ev["shank"] = np.full(n, s, dtype=int)
     ev["channel"] = np.full(n, ch, dtype=int)

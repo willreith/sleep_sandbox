@@ -33,6 +33,18 @@ neighbours:               # automated stand-in for Zhang's manual curation. The 
   min_duration_s: 0.030
   max_duration_s: 0.200
 
+spectrum:                 # per-event peak frequency, computed on the WIDEBAND trace around each
+                          # event peak. This is an annotation on events, not a detection criterion,
+                          # so it is deliberately NOT part of the run_id hash -- it adds a column
+                          # without changing which events exist.
+  window_s: 0.2           # 250 samples at 1250 Hz, centred on the event peak
+  nfft: 512               # zero-padded from 250, so 2.44 Hz bins
+  search_band: [100, 300] # argmax range. Do not raise the top: the LFP was lowpassed at 300 Hz in
+                          # preprocessing, so anything above it is filter roll-off, not signal.
+  background_band: [80, 130]  # 1/f reference the peak's prominence is measured against. Must stay
+                          # BELOW the passband -- an upper flank would sit in the 300 Hz roll-off
+                          # and measure the preprocessing filter rather than the tissue.
+
 channel_selection:                # a PSD over the whole 22 h recording is infeasible, so band power
                                   # per channel is averaged over a sample of NREM windows
   method: smoothed                # which score selects: raw | smoothed | delta_ratio (all three are
