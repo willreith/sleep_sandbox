@@ -5,8 +5,8 @@
 #SBATCH --nodes=1
 #SBATCH --ntasks-per-node=1
 #SBATCH --cpus-per-task=4
-#SBATCH --mem=24G
-#SBATCH --time=3:00:00
+#SBATCH --mem=32G
+#SBATCH --time=2:00:00
 
 # ---------------------------------------------------------------------------
 # Ripple detection on the per-shank channels chosen by select_ripple_channel.py
@@ -14,16 +14,19 @@
 # Config: all paths come from the gitignored .env at the repo root.
 # Submit from the repo root (cd there first) so $SLURM_SUBMIT_DIR points to it.
 #
-# Memory: all (1 candidate + 3 neighbours) x n_shanks channels are read in one pass and held,
-# because a single-channel read of a sample-interleaved binary touches every page of the recording
-# anyway -- reading them separately would be that many full passes over ~123G. seg5-148 is 22.33 h
-# at 1250 Hz = 8.0e7 samples, so the resident batch is 5.1G for ProbeA (4 shanks, 16 channels) and
-# 3.9G for ProbeB (3 shanks, 12 -- its channel map leaves the x=219 shank empty). On top of that one
-# envelope is computed at a time, peaking inside hilbert at ~3.2G (float64 trace + filtered +
-# complex128 FFT workspace + envelope, 0.64G each). ~8.3G worst case, so 24G is ~3x headroom.
-# Time: one pass over the derivative, then 12-16 x (sosfiltfilt + hilbert) on 8.0e7 samples, so now
-# CPU-bound rather than I/O-bound. 3 h is headroom, not an estimate; /usr/bin/time -v measures the
-# first run.
+# Sizing below is measured, not projected -- the first attempt (job 3391559, 24G/3h) TIMED OUT with
+# MaxRSS pinned at exactly the 24G cap, having never finished reading. Cause was an unchunked
+# get_traces over the whole memmap; see the comment in run_ripples.py. Do not "simplify" that read.
+#
+# Memory: seg5-148 is 24.00 h at 1250 Hz = 1.08e8 samples of int16, an 83G file. The resident batch
+# is (1 candidate + up to 3 neighbours) x n_shanks channels kept as int16: 3.2G for ProbeA (15
+# channels -- 16 minus the shank-1 pick, which sits at a column end and has no 'above' neighbour)
+# and 2.6G for ProbeB (12; its channel map leaves the x=219 shank empty). One envelope is computed
+# at a time on top of that, measured at 1.21G per 2e7 samples and linear, so ~12G at 1.08e8 (float64
+# trace + filtered + two complex128 FFT workspaces + envelope). ~15.5G peak, so 32G is ~2x. 24G
+# would likely fit, but the failure above is expensive enough to not retry at 1.5x.
+# Time: measured 2.3 min for a full chunked pass, and 20.5 s per channel for sosfiltfilt + hilbert
+# (2.0 s at 1e7, 3.8 s at 2e7, linear), so ~2.3 + 15 x 0.34 = ~8 min of real work. 2 h is headroom.
 #
 # Overrides (env, via --export):
 #   SEG    preprocessed segment range   (default seg5-148)
