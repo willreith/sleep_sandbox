@@ -22,6 +22,8 @@ dependencies = [
     "kilosort",
     "streamlit",          # interactive ripple-explorer GUI
     "diptest",            # Hartigan's dip test for channel bimodality selection
+    "spikeinterface>=0.103.2",
+    "wavpack-numcodecs>=0.2.3",
 ]
 
 [project.optional-dependencies]
