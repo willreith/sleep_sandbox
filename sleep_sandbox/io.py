@@ -7,11 +7,13 @@ import hashlib
 import warnings
 
 import numpy as np
+import pandas as pd
 import spikeinterface.full as si
 
 from pathlib import Path
 
 _SUFFIX_RE = re.compile(r"AmplifierData_(\d+)\.bin$")
+_SHANK_RE = re.compile(r"_shank_(\d+)\.zarr$")
 
 
 def find_amplifier_files(session_dir, probe, suffixes=None):
@@ -111,6 +113,78 @@ def load_preprocessed(parent, stream):
             f"Multiple '{stream}' derivatives under {parent}: {[m.name for m in matches]}"
         )
     return si.load(matches[0])
+
+
+# --- Pre-downsampled 1250 Hz zarr input --------------------------------------
+# Stage A is done upstream (bandpass 0.25-300 Hz -> per-shank common median reference ->
+# resample 1250 Hz). The zarr carries t_start = 0 and no provenance, so absolute time comes
+# from the ephys-paths CSV that drove the upstream concatenation.
+
+def load_session_timeline(csv_path):
+    """Return (rec_start, blocks) for a pre-downsampled session, from its ephys-paths CSV.
+
+    blocks has start/end/path per acquisition block. The upstream loader zero-fills missing blocks
+    rather than skipping them, so the timeline is gap-free by construction and frame index maps
+    onto wall clock as rec_start + frame / fs. That invariant is what every chunk boundary rests
+    on, so it is asserted here rather than assumed."""
+    blocks = pd.read_csv(csv_path, parse_dates=["start", "end"])
+    gaps = blocks["start"].values[1:] != blocks["end"].values[:-1]
+    if gaps.any():
+        raise ValueError(f"{csv_path}: {gaps.sum()} gap(s) between blocks, first at row {gaps.argmax() + 1}")
+    return blocks["start"].iloc[0], blocks
+
+
+def blank_intervals(blocks, rec_start):
+    """Seconds-from-rec_start (start, end) spans of the CSV's zero-filled 'blank' blocks.
+
+    Only the blocks the upstream loader knew were missing; short real files it zero-padded are
+    not marked here (detect those from the data instead)."""
+    blank = blocks[blocks["path"] == "blank"]
+    return [((s - rec_start).total_seconds(), (e - rec_start).total_seconds())
+            for s, e in zip(blank["start"], blank["end"])]
+
+
+def midday_chunks(rec_start, n_frames, fs, split_hour=12, min_chunk_h=12):
+    """Split a recording into ~24 h chunks at split_hour each day; returns a list of dicts with
+    label, t_start, t_end, start_frame, end_frame.
+
+    A leading chunk shorter than min_chunk_h is absorbed into the next one (a recording starting at
+    09:00 runs to midday the following day, 27 h), and a trailing chunk shorter than min_chunk_h is
+    merged back into the previous one. Frames tile the recording exactly: no gaps, no overlap."""
+    rec_end = rec_start + pd.Timedelta(seconds=n_frames / fs)
+    days = pd.date_range(rec_start.normalize(), rec_end.normalize(), freq="D")
+    edges = [t for t in days + pd.Timedelta(hours=split_hour) if rec_start < t < rec_end]
+    edges = [rec_start, *edges, rec_end]
+
+    min_s = min_chunk_h * 3600
+    if len(edges) > 2 and (edges[1] - edges[0]).total_seconds() < min_s:
+        edges.pop(1)
+    if len(edges) > 2 and (edges[-1] - edges[-2]).total_seconds() < min_s:
+        edges.pop(-2)
+
+    return [{"label": f"chunk{i:02d}_{s:%Y-%m-%d}", "t_start": s, "t_end": e,
+             "start_frame": round((s - rec_start).total_seconds() * fs),
+             "end_frame": round((e - rec_start).total_seconds() * fs)}
+            for i, (s, e) in enumerate(zip(edges[:-1], edges[1:]))]
+
+
+def load_input_recording(zarr_paths):
+    """Load one or more per-shank 1250 Hz zarrs as a single recording, with 'group' set to the
+    shank index parsed from each filename.
+
+    Each file was written after split_by('group'), so every one of them carries group = 0 and a
+    probegroup listing only its own shank; without the reassignment an aggregate looks like one
+    shank and make_emg_pairs cannot form a cross-shank pair."""
+    recs = []
+    for p in zarr_paths:
+        p = Path(p)
+        m = _SHANK_RE.search(p.name)
+        if m is None:
+            raise ValueError(f"cannot parse shank index from {p.name}")
+        rec = si.read_zarr(p)
+        rec.set_property("group", np.full(rec.get_num_channels(), int(m.group(1))))
+        recs.append(rec)
+    return recs[0] if len(recs) == 1 else si.aggregate_channels(recs)
 
 
 # --- BNO055 IMU streams ------------------------------------------------------
