@@ -26,7 +26,7 @@ STATES = ("nrem", "rem", "wake")
 def classify(sw_metric, theta_metric, motion_metric, sw_thresh, startbins=12, maxbins=25,
              method="histogram", grid_n=512, dt=1.0, merge_shorter_than_s=None,
              min_state_s=None, microarousal_max_s=None, theta_conditioned=True,
-             motion_thresh=None, th_thresh=None, min_prominence_frac=0.03):
+             motion_thresh=None, th_thresh=None, min_prominence_frac=0.03, theta_fallback_all=False):
     """buzcode ClusterStates_DetermineStates decision tree on already-smoothed/[0,1] metrics:
     motion threshold -> movement-conditioned theta threshold -> NREM/REM/WAKE masks, then the
     Watson duration criteria. Split out of score_recording so alternative motion signals (IMU
@@ -43,13 +43,20 @@ def classify(sw_metric, theta_metric, motion_metric, sw_thresh, startbins=12, ma
     min_state_s: NREM/REM runs shorter than this become wake (None = off).
     microarousal_max_s: MA upper bound (None = off). rem_cand/mov are pre-merge intermediates.
     motion_thresh/th_thresh override the thresholds this would derive from the passed metrics, so
-    thresholds estimated on one window can be applied to another (check_threshold_stability.py)."""
+    thresholds estimated on one window can be applied to another (check_threshold_stability.py).
+    theta_fallback_all: if the conditioned theta trough is NaN, take it on all non-NaN bins instead; that
+    trough mostly marks NREM vs non-NREM, not REM vs quiet wake. th_thresh_source records which one set it."""
     if motion_thresh is None:
         motion_thresh = find_thresh(motion_metric, method, startbins, maxbins, grid_n,
                                     min_prominence_frac, label="motion")
     derived_th, mov = conditioned_theta_thresh(
         theta_metric, sw_metric, motion_metric, sw_thresh, motion_thresh, startbins, maxbins,
         method, grid_n, theta_conditioned, min_prominence_frac)
+    th_source = "given" if th_thresh is not None else "group" if np.isfinite(derived_th) else "none"
+    if th_source == "none" and theta_fallback_all:
+        derived_th = find_thresh(theta_metric, method, startbins, maxbins, grid_n, min_prominence_frac,
+                                 label="theta|all (fallback)")
+        th_source = "all_bins" if np.isfinite(derived_th) else "none"
     if th_thresh is None:
         th_thresh = derived_th
 
@@ -72,11 +79,12 @@ def classify(sw_metric, theta_metric, motion_metric, sw_thresh, startbins=12, ma
 
     return {"nrem": nrem, "rem": rem, "wake": wake, "qwake": wake & (theta_metric <= th_thresh),
             "ma": ma, "rem_cand": rem_cand, "mov": mov,
-            "motion_thresh": motion_thresh, "th_thresh": th_thresh}
+            "motion_thresh": motion_thresh, "th_thresh": th_thresh, "th_thresh_source": th_source}
 
 
 def score_recording(recording_lfp, recording_emg, scoring_config,
-                     imu_t=None, imu_valid=None, imu_speed=None, theta_conventions=None):
+                     imu_t=None, imu_valid=None, imu_speed=None, theta_conventions=None, emg=None,
+                     sw_channel=None, th_channel=None, sw_basis=None, th_recording=None):
     """Run the pipeline; recording_lfp/recording_emg are the preprocessed lfp_cmr/emg derivatives.
     imu_t/imu_valid/imu_speed: optional aligned IMU translational speed (align_bno055_to_lfp +
     imu_kinematics, already run by the caller); if given, IMU speed is binned onto the same grid.
@@ -85,6 +93,12 @@ def score_recording(recording_lfp, recording_emg, scoring_config,
     scoring_config['theta']['report_conventions']; pass [] explicitly to force none regardless of
     config. All conventions -- concordant and extra -- share the single peakTH-selected channel;
     only the band definition varies per convention, not the channel (see NB below; may change later).
+    emg: optional precomputed (score, times) from emg_from_lfp on this recording's time base; skips the
+    EMG computation, and recording_emg may then be None.
+    sw_channel/th_channel: skip the dip-test/peakTH scans and use these channel indices.
+    sw_basis: fit_pc1_basis-style dict (loading/mu/sd); PC1 is then projected on it ('global') instead of refit.
+    th_recording: take theta (selection and ratio) from this recording, on recording_lfp's time base; th_channel indexes it.
+    'nodata' (gaps widened by missing_data.gap_margin_s, plus bins without EMG) is NaN in every metric and in no state mask.
     Returns a dict of per-timepoint arrays (on 'times'), boolean state masks, and scalars."""
     fs = recording_lfp.get_sampling_frequency()
 
@@ -104,52 +118,73 @@ def score_recording(recording_lfp, recording_emg, scoring_config,
     dur_cfg = scoring_config["duration_criteria"]
 
     # Slow-wave: dip-test channel selection -> PC1 -> smoothed/normed metric -> threshold.
-    print(f"  [score_recording] slow-wave channel selection (dip test, every {channel_stride}th channel)...",
-          flush=True)
-    sw_channel, _, _ = select_channel_by_dip(
-        recording_lfp, fs, channel_stride, manual_channel, pc=pc_index,
-        orientation_freq_hz=orientation_freq_hz, **spectrogram_kwargs)
+    if sw_channel is None:
+        print(f"  [score_recording] slow-wave channel selection (dip test, every {channel_stride}th channel)...",
+              flush=True)
+        sw_channel, _, _ = select_channel_by_dip(
+            recording_lfp, fs, channel_stride, manual_channel, pc=pc_index,
+            orientation_freq_hz=orientation_freq_hz, **spectrogram_kwargs)
     print(f"  [score_recording] slow-wave channel = {sw_channel}; computing PC1 + threshold...", flush=True)
     sw_trace = recording_lfp.get_traces(channel_ids=[recording_lfp.channel_ids[sw_channel]]).squeeze()
     sw_pc1, _, _, _, times = broadband_pc1(
-        sw_trace, fs, pc=pc_index, orientation_freq_hz=orientation_freq_hz, **spectrogram_kwargs)
-    sw_metric = smooth_norm(sw_pc1, step_s=step_s, win_s=smooth_win_s)
-    sw_thresh = find_thresh(sw_metric, thresh_cfg["method"], bt_startbins, bt_maxbins,
-                            thresh_cfg["kde_grid_n"], thresh_cfg["min_prominence_frac"],
-                            label="slow_wave")
+        sw_trace, fs, pc=pc_index, orientation_freq_hz=orientation_freq_hz,
+        mode="refit" if sw_basis is None else "global", basis=sw_basis, **spectrogram_kwargs)
 
     # Theta: peakTH channel selection, then the concordant convention's ratio on that channel.
     peak_band = scoring_config["theta"]["channel_peak_band"]
     concordant_conv = scoring_config["theta"]["concordant_convention"]
     if theta_conventions is None:
         theta_conventions = scoring_config["theta"].get("report_conventions", [])
-    print(f"  [score_recording] theta channel selection (peakTH, every {channel_stride}th channel)...", flush=True)
-    th_channel, _, _ = select_theta_channel_peak(
-        recording_lfp, fs, theta=tuple(peak_band["theta"]), denom=tuple(peak_band["denom"]),
-        stride=channel_stride, **spectrogram_kwargs)
+    th_rec = recording_lfp if th_recording is None else th_recording
+    if th_channel is None:
+        print(f"  [score_recording] theta channel selection (peakTH, every {channel_stride}th channel)...",
+              flush=True)
+        th_channel, _, _ = select_theta_channel_peak(
+            th_rec, fs, theta=tuple(peak_band["theta"]), denom=tuple(peak_band["denom"]),
+            stride=channel_stride, **spectrogram_kwargs)
     print(f"  [score_recording] theta channel = {th_channel}; computing ratio(s) "
           f"({concordant_conv} + {theta_conventions})...", flush=True)
-    th_trace = recording_lfp.get_traces(channel_ids=[recording_lfp.channel_ids[th_channel]]).squeeze()
+    th_trace = th_rec.get_traces(channel_ids=[th_rec.channel_ids[th_channel]]).squeeze()
     th_spec, th_freqs, _ = log_spectrogram(th_trace, fs, **spectrogram_kwargs)
-    theta_metric = smooth_norm(theta_ratio(th_spec, th_freqs, concordant_conv), step_s=step_s, win_s=smooth_win_s)
+    th_ratio = theta_ratio(th_spec, th_freqs, concordant_conv)
     # NB: all extra conventions reuse this same peakTH channel/spectrogram -- only the band
     # definition varies, not the channel. Each convention picking its own best channel (as the
     # notebook's diagnostic comparison does, via select_theta_channel/dip-test) is a possible
     # future change, not done here.
-    extra_theta = {
-        f"theta_metric_{conv}": smooth_norm(theta_ratio(th_spec, th_freqs, conv), step_s=step_s, win_s=smooth_win_s)
-        for conv in (theta_conventions or [])
-    }
+    extra_ratios = {conv: theta_ratio(th_spec, th_freqs, conv) for conv in (theta_conventions or [])}
 
     # EMG: cross-shank high-frequency correlation proxy, binned onto the same grid.
     emg_cfg = scoring_config["emg"]
     print(f"  [score_recording] EMG proxy ({emg_cfg['n_pairs']} channel pairs)...", flush=True)
-    emg_shanks = recording_emg.get_probes()[0].shank_ids.astype(int)
-    emg_pairs, _ = make_emg_pairs(
-        emg_shanks, n_pairs=emg_cfg["n_pairs"], min_shank_dist=emg_cfg["min_shank_dist"], seed=emg_cfg["seed"])
-    emg_score, emg_times = emg_from_lfp(recording_emg, emg_pairs, win_s=emg_cfg["window_s"])
+    if emg is None:
+        emg_shanks = recording_emg.get_probes()[0].shank_ids.astype(int)
+        emg_pairs, _ = make_emg_pairs(
+            emg_shanks, n_pairs=emg_cfg["n_pairs"], min_shank_dist=emg_cfg["min_shank_dist"], seed=emg_cfg["seed"])
+        emg_score, emg_times = emg_from_lfp(recording_emg, emg_pairs, win_s=emg_cfg["window_s"])
+    else:
+        emg_score, emg_times = emg
     emg_b = np.interp(times, emg_times, emg_score)
-    motion_metric = smooth_norm(emg_b, step_s=step_s, win_s=smooth_win_s)
+
+    # nodata: zero-power bins (recording gaps), widened by missing_data.gap_margin_s either side, plus
+    # bins with no EMG. Windows partly inside a gap, and the upstream filter ringing next to it, project
+    # far outside the real PC1 range and would set smooth_norm's min-max, so these bins go NaN before
+    # smoothing and never reach a normalisation or threshold (see config for the measured extent).
+    # All False on gap-free data with complete EMG, which leaves earlier results unchanged.
+    edge = int(round(scoring_config["missing_data"]["gap_margin_s"] / step_s))
+    nodata = np.convolve(np.isnan(sw_pc1), np.ones(2 * edge + 1), mode="same") > 0
+    nodata |= np.isnan(emg_b)
+    sw_pc1 = np.where(nodata, np.nan, sw_pc1)
+
+    def masked_smooth(x):
+        return smooth_norm(np.where(nodata, np.nan, x), step_s=step_s, win_s=smooth_win_s)
+
+    sw_metric = masked_smooth(sw_pc1)
+    sw_thresh = find_thresh(sw_metric, thresh_cfg["method"], bt_startbins, bt_maxbins,
+                            thresh_cfg["kde_grid_n"], thresh_cfg["min_prominence_frac"],
+                            label="slow_wave")
+    theta_metric = masked_smooth(th_ratio)
+    extra_theta = {f"theta_metric_{conv}": masked_smooth(r) for conv, r in extra_ratios.items()}
+    motion_metric = masked_smooth(emg_b)
 
     print("  [score_recording] movement-conditioned theta threshold + states...", flush=True)
     states = classify(sw_metric, theta_metric, motion_metric, sw_thresh, bt_startbins, bt_maxbins,
@@ -158,13 +193,17 @@ def score_recording(recording_lfp, recording_emg, scoring_config,
                       min_state_s=dur_cfg["min_state_s"],
                       microarousal_max_s=dur_cfg["microarousal_max_s"],
                       theta_conditioned=scoring_config["theta"]["movement_conditioned"],
-                      min_prominence_frac=thresh_cfg["min_prominence_frac"])
+                      min_prominence_frac=thresh_cfg["min_prominence_frac"],
+                      theta_fallback_all=scoring_config["theta"]["fallback_all_bins"])
+    # nodata bins compare False against every threshold and so land in wake; take them out of every mask.
+    for k in ("nrem", "rem", "wake", "qwake", "ma"):
+        states[k] = states[k] & ~nodata
 
     result = {
         "times": times, "sw_pc1": sw_pc1,
         "sw_metric": sw_metric, "theta_metric": theta_metric, "motion_metric": motion_metric,
         "sw_channel": sw_channel, "theta_channel": th_channel, "sw_thresh": sw_thresh,
-        **states,
+        **states, "nodata": nodata,
         **extra_theta,
     }
 
@@ -285,11 +324,11 @@ def plot_summary(result, out_dir=None, metrics=None, xcorr_max_lag_s=120.0):
     return figs
 
 
-def save_run(result, scoring_config, out_path, source_dirs):
+def save_run(result, scoring_config, out_path, source_dirs, provenance=None):
     """Save the per-timepoint arrays (np.savez) plus a sidecar YAML recording scoring_config
     and, for each {stream_name: folder} in source_dirs, that derivative's canonical
     preprocessing params (its params.json) and seg_source (the folder's parent dir name,
-    e.g. 'ProbeA_seg5-52')."""
+    e.g. 'ProbeA_seg5-52'). provenance: extra dict written as-is, for inputs without a params.json."""
     out_path = Path(out_path)
     arrays = {k: v for k, v in result.items() if isinstance(v, np.ndarray)}
     np.savez(out_path, **arrays)
@@ -310,6 +349,8 @@ def save_run(result, scoring_config, out_path, source_dirs):
         sources[stream] = {"folder": folder.name, "seg_source": folder.parent.name, "params": params}
 
     sidecar = {"scoring_config": scoring_config, "result_scalars": scalars, "sources": sources}
+    if provenance is not None:
+        sidecar["provenance"] = provenance
     with open(out_path.with_suffix(".yml"), "w") as f:
         yaml.safe_dump(sidecar, f, sort_keys=False)
 
