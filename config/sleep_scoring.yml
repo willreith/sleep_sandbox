@@ -17,6 +17,12 @@ slow_wave:                         # broadband PC1 (steps 1-4, Watson et al.)
   pc_index: 1                      # which principal component to use as the slow-wave score
   orientation_freq_hz: 20.0        # sign-flip PC if the mean loading below this freq is negative
 
+missing_data:
+  gap_margin_s: 45                 # nodata extends this far beyond each zero-power spectrogram bin. Upstream
+                                   # bandpass rings at the signal/zero-fill edge: RMS up to ~200x baseline from
+                                   # ~30 s before the zeros to ~25 s after (2026-07-06 gap). One 10 s window of
+                                   # margin left PC1 outliers of 23-41 against a 1-99% range of -8.8 to 5.2.
+
 smoothing:
   window_s: 15.0                   # centred moving average applied before [0,1]-normalising a metric
 
@@ -61,6 +67,10 @@ theta:
                                    # mostly marks the NREM/non-NREM boundary (the low-theta mode IS
                                    # the NREM population), which the ~nrem term already handles.
                                    # See docs/sleep_classification_algorithm.md, "Thresholding".
+  fallback_all_bins: true          # if the ~nrem & ~mov trough is NaN, take it on all valid bins (2026-09-21).
+                                   # That trough mostly marks NREM vs non-NREM (chunk 1, no-CMR ch300:
+                                   # 4% of NREM vs 64% of non-NREM above it), so REM becomes "not NREM, not
+                                   # moving, theta above NREM level". Recorded as th_thresh_source.
   concordant_convention: watson    # convention used for the buzcode-order concordant theta threshold
   report_conventions: [watson, shin, shin_mod]   # extra conventions to also report (theta_metric_<name>);
                                    # override per-call via score_recording's theta_conventions arg
