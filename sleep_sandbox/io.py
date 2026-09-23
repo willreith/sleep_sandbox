@@ -13,7 +13,7 @@ import spikeinterface.full as si
 from pathlib import Path
 
 _SUFFIX_RE = re.compile(r"AmplifierData_(\d+)\.bin$")
-_SHANK_RE = re.compile(r"_shank_(\d+)\.zarr$")
+_SHANK_RE = re.compile(r"_shank_?(\d+)\.zarr$")
 
 
 def find_amplifier_files(session_dir, probe, suffixes=None):
