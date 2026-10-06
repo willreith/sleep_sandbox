@@ -4,7 +4,8 @@ Human-readable doc for the ripple-detection track. Separate from the sleep-class
 (`sleep_classification.md`, `sleep_classification_algorithm.md`, `threshold_comparison.md`), which
 it depends on only for NREM epoch masks.
 
-Status: exploratory code exists; the refined pipeline described below is **planned, not built**.
+Status (2026-09-26): the pipeline below is **built** and has run once, on seg5-148 (both probes).
+Results, build progress and what is next: `ANALYSIS_FRAMEWORK.md`, Track 2.
 
 ## Scope
 
@@ -57,7 +58,7 @@ recordings. Long recordings go through the batch driver (below) and produce an e
 the dict-of-arrays convention `score_recording` already uses. Run-finding is vectorised; the
 per-sample Python loop in the original would not survive ~100 M samples.
 
-## Planned pipeline
+## Pipeline
 
 Parameters live in `config/ripple.yml` (not hardcoded in the app or the library).
 
@@ -70,11 +71,36 @@ Parameters live in `config/ripple.yml` (not hardcoded in the app or the library)
 5. **Threshold** — extent at 2 SD, peak ≥5 SD.
 6. **Merge** (optional, default off) — events separated by < `min_inter_event_ms`.
 7. **Duration filter** — 30–200 ms.
-8. **Neighbour corroboration** — require *k* adjacent channels to show a co-occurring event.
-9. **Output** — event table + summary statistics.
+8. **Neighbour corroboration** — count adjacent channels with a co-occurring event (every
+   candidate saved with its count; *k* is applied as a filter afterwards).
+9. **Spectral annotation** — per-event peak frequency and prominence over 80–130 Hz background,
+   on the wideband trace. Annotation only; does not remove events.
+10. **Output** — event table + summary statistics (`run_ripples.py`), then cross-probe figures and
+    `stats.yml` (`plot_ripple_events.py`).
 
 Order of operations for 5–7 is load-bearing: merging after the duration filter is useless, because
 the fragments have already been deleted.
+
+## Chunked recordings (zarr input, 2026-09-26)
+
+For the upstream per-shank zarrs (abcEphysPilot04 first), `scripts/submit_ripples_chunked.sh` runs:
+
+| stage | script | unit of work |
+|---|---|---|
+| select | `select_ripple_channel_chunked.py` | once per reference arm, NREM windows pooled over all chunks |
+| detect | `run_ripples_chunked.py` | chunk × arm; baseline re-estimated per chunk; all merge windows in one pass |
+| plot | `plot_ripple_events.py --events-dir` | chunk × arm × run, the seg-mode figures for one probe |
+| summary | `plot_ripple_chunks.py` | every run: properties across chunks, and agreement between arms |
+
+- **Two reference arms**, because the Pilot04 LFP is not referenced: `none` (as stored) and `cmr`
+  (per-shank median, applied on read). Each arm has its own channel selection.
+- **Channels are fixed across chunks**; the z-score baseline is per chunk (this addresses the
+  baseline-drift item under Open decisions for day-scale drift, not within-day drift).
+- Chunks are padded 10 s for the filter; the padding is cleared from the NREM and baseline masks,
+  and a candidate's peak must lie inside the chunk.
+- Event times are absolute recording frames/seconds, the clock of the scoring result's `times_abs`.
+- Output: `{experiment}/{lfp dir}/{probe}_shanks{...}/ripples/{none,cmr}/{channel_selection,
+  events/{run_id}/{chunk},summary/{run_id}/{chunk}}` and `ripples/comparison/`.
 
 ## Integration with sleep classification
 
@@ -187,7 +213,9 @@ criteria that would target the real false positives are:
 - a **cycle-count / instantaneous-frequency test** — a real ripple has ≥3–4 in-band cycles.
   `ripple_detection.ipynb` already computes `inst_freq` and never uses it.
 
-Neither is planned yet.
+The spectral-peak test now exists as an annotation (`peak_hz`, `prominence` columns), not as a
+filter; on seg5-148 it does not separate target from control shanks. The noise-reference channel
+and the cycle-count test are not built.
 
 ## Planned sensitivity analyses
 
