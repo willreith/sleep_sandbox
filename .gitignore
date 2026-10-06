@@ -10,6 +10,9 @@ rawdata/
 derivatives/
 src/
 
+# Docs
+docs/local_*
+
 # Python
 __pycache__/
 *.py[cod]
@@ -24,6 +27,7 @@ env/
 # Jupyter
 .ipynb_checkpoints/
 *.ipynb_checkpoints
+notebooks/local_*
 
 # OS
 .DS_Store
@@ -42,7 +46,12 @@ sorting_output/
 CLAUDE.md
 docs/QRSPI_WORKFLOW.md
 docs/ANALYSIS_FRAMEWORK.md
+docs/analysis_map.html
 
 # Other
 docs/private/
 uv.lock
+
+# SLURM/HPC
+*.out
+*.sh
