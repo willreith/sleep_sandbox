@@ -26,7 +26,8 @@ STATES = ("nrem", "rem", "wake")
 def classify(sw_metric, theta_metric, motion_metric, sw_thresh, startbins=12, maxbins=25,
              method="histogram", grid_n=512, dt=1.0, merge_shorter_than_s=None,
              min_state_s=None, microarousal_max_s=None, theta_conditioned=True,
-             motion_thresh=None, th_thresh=None, min_prominence_frac=0.03, theta_fallback_all=False):
+             motion_thresh=None, th_thresh=None, min_prominence_frac=0.03, theta_fallback_all=False,
+             theta_exclude_mov=True):
     """buzcode ClusterStates_DetermineStates decision tree on already-smoothed/[0,1] metrics:
     motion threshold -> movement-conditioned theta threshold -> NREM/REM/WAKE masks, then the
     Watson duration criteria. Split out of score_recording so alternative motion signals (IMU
@@ -51,8 +52,9 @@ def classify(sw_metric, theta_metric, motion_metric, sw_thresh, startbins=12, ma
                                     min_prominence_frac, label="motion")
     derived_th, mov = conditioned_theta_thresh(
         theta_metric, sw_metric, motion_metric, sw_thresh, motion_thresh, startbins, maxbins,
-        method, grid_n, theta_conditioned, min_prominence_frac)
-    th_source = "given" if th_thresh is not None else "group" if np.isfinite(derived_th) else "none"
+        method, grid_n, theta_conditioned, min_prominence_frac, theta_exclude_mov)
+    pool = "group" if theta_exclude_mov else "non_nrem"
+    th_source = "given" if th_thresh is not None else pool if np.isfinite(derived_th) else "none"
     if th_source == "none" and theta_fallback_all:
         derived_th = find_thresh(theta_metric, method, startbins, maxbins, grid_n, min_prominence_frac,
                                  label="theta|all (fallback)")
@@ -84,7 +86,8 @@ def classify(sw_metric, theta_metric, motion_metric, sw_thresh, startbins=12, ma
 
 def score_recording(recording_lfp, recording_emg, scoring_config,
                      imu_t=None, imu_valid=None, imu_speed=None, theta_conventions=None, emg=None,
-                     sw_channel=None, th_channel=None, sw_basis=None, th_recording=None):
+                     sw_channel=None, th_channel=None, sw_basis=None, th_recording=None,
+                     theta_exclude_mov=True):
     """Run the pipeline; recording_lfp/recording_emg are the preprocessed lfp_cmr/emg derivatives.
     imu_t/imu_valid/imu_speed: optional aligned IMU translational speed (align_bno055_to_lfp +
     imu_kinematics, already run by the caller); if given, IMU speed is binned onto the same grid.
@@ -194,7 +197,8 @@ def score_recording(recording_lfp, recording_emg, scoring_config,
                       microarousal_max_s=dur_cfg["microarousal_max_s"],
                       theta_conditioned=scoring_config["theta"]["movement_conditioned"],
                       min_prominence_frac=thresh_cfg["min_prominence_frac"],
-                      theta_fallback_all=scoring_config["theta"]["fallback_all_bins"])
+                      theta_fallback_all=scoring_config["theta"]["fallback_all_bins"],
+                      theta_exclude_mov=theta_exclude_mov)
     # nodata bins compare False against every threshold and so land in wake; take them out of every mask.
     for k in ("nrem", "rem", "wake", "qwake", "ma"):
         states[k] = states[k] & ~nodata
