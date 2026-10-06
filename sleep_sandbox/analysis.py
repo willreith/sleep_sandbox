@@ -28,22 +28,61 @@ def log_spectrogram(trace, fs, freqs=None, window_s=10.0, step_s=1.0,
     return spec, freqs, times
 
 
-def broadband_pc1(trace, fs, pc=1, orientation_freq_hz=20.0, **spectrogram_kwargs):
+def broadband_pc1(trace, fs, pc=1, orientation_freq_hz=20.0, mode="refit", basis=None, **spectrogram_kwargs):
     """Steps 1-4 on one channel: STFT -> log-freq power -> log10 -> per-freq z-score -> PCA -> oriented PC1.
     orientation_freq_hz: sign-flip PC if the mean loading below this freq is negative.
+    mode: 'refit' fits loading/mu/sd here; 'global' and 'middle' project onto basis (see project_pc1).
     spectrogram_kwargs: forwarded to log_spectrogram (window_s, step_s, freq_min, freq_max, n_freq_bins, freqs)."""
     pc_index = pc - 1
     spec, freqs, times = log_spectrogram(trace, fs, **spectrogram_kwargs)
+    if mode != "refit":
+        if basis is None:
+            raise ValueError(f"mode={mode!r} needs a basis from fit_pc1_basis")
+        return project_pc1(spec, basis, mode), basis["loading"], spec, freqs, times
 
-    logspec = np.log10(spec)
+    # Zero-power bins are recording gaps the upstream loader zero-filled. log10(0) = -inf, and a
+    # single -inf takes the per-frequency z-score and the PCA with it -- poisoning the whole
+    # recording, not just the gap -- so fit on the real bins and mark the rest NaN.
+    valid = spec.sum(axis=0) > 0
+    logspec = np.log10(spec[:, valid])
     zspec = (logspec - logspec.mean(axis=1, keepdims=True)) / logspec.std(axis=1, keepdims=True)
 
     pca = PCA()
     scores = pca.fit_transform(zspec.T)
-    pc1, loading = scores[:, pc_index], pca.components_[pc_index]
+    loading = pca.components_[pc_index]
+    pc1 = np.full(len(times), np.nan)
+    pc1[valid] = scores[:, pc_index]
     if loading[freqs < orientation_freq_hz].mean() < 0:  # orient: high score = more slow wave
         pc1, loading = -pc1, -loading
     return pc1, loading, spec, freqs, times
+
+
+def fit_pc1_basis(spec, freqs, pc=1, orientation_freq_hz=20.0):
+    """broadband_pc1's fit as a reusable basis: per-freq log10 mean/std and the oriented loading, on non-gap bins."""
+    valid = spec.sum(axis=0) > 0
+    logspec = np.log10(spec[:, valid])
+    mu, sd = logspec.mean(axis=1), logspec.std(axis=1)
+    pca = PCA().fit(((logspec - mu[:, None]) / sd[:, None]).T)
+    loading = pca.components_[pc - 1]
+    if loading[freqs < orientation_freq_hz].mean() < 0:
+        loading = -loading
+    return {"loading": loading, "mu": mu, "sd": sd, "freqs": freqs,
+            "var_explained": float(pca.explained_variance_ratio_[pc - 1])}
+
+
+def project_pc1(spec, basis, mode="global"):
+    """PC1 per bin on basis['loading']: 'global' z-scores with basis mu/sd, 'middle' with spec's own; gaps NaN."""
+    valid = spec.sum(axis=0) > 0
+    logspec = np.log10(spec[:, valid])
+    if mode == "global":
+        mu, sd = basis["mu"], basis["sd"]
+    elif mode == "middle":
+        mu, sd = logspec.mean(axis=1), logspec.std(axis=1)
+    else:
+        raise ValueError(f"unknown PC1 projection mode {mode!r}")
+    pc1 = np.full(spec.shape[1], np.nan)
+    pc1[valid] = basis["loading"] @ ((logspec - mu[:, None]) / sd[:, None])
+    return pc1
 
 
 def select_channel_by_dip(rec, fs, stride=16, manual_channel=None, **pc1_kwargs):
@@ -54,7 +93,8 @@ def select_channel_by_dip(rec, fs, stride=16, manual_channel=None, **pc1_kwargs)
     dip_stats = np.full(n_ch, np.nan)
     traces = rec.get_traces(channel_ids=rec.channel_ids[candidate_idx])  # one pass over the file
     for j, ci in enumerate(candidate_idx):
-        dip_stats[ci] = diptest(broadband_pc1(traces[:, j], fs, **pc1_kwargs)[0])[0]
+        pc1 = broadband_pc1(traces[:, j], fs, **pc1_kwargs)[0]
+        dip_stats[ci] = diptest(pc1[~np.isnan(pc1)])[0]    # gaps carry no bimodality information
     best_channel = manual_channel if manual_channel is not None else int(np.nanargmax(dip_stats))
     return best_channel, dip_stats, candidate_idx
 
@@ -63,13 +103,21 @@ def smooth_norm(x, step_s=1.0, win_s=15.0):
     """buzcode metric prep before thresholding: centred moving average over win_s seconds, then
     min-max to [0, 1]. Mirrors smooth(metric, smoothfact/specdt) (smoothfact=15) + bz_NormToRange
     ([0 1]) in ClusterStates_GetMetrics. step_s is the metric bin width (1 s on the sw_times grid);
-    edges use a shrinking window (local mean), approximating MATLAB smooth."""
+    edges use a shrinking window (local mean), approximating MATLAB smooth.
+
+    NaN (a recording gap) is skipped rather than propagated: the denominator counts only real
+    samples, so a window straddling a gap averages just those -- the same shrinking-window rule the
+    edges already used. Gaps stay NaN in the output (they are not interpolated across), and the
+    [0, 1] range is taken over the real samples."""
     n = max(1, int(round(win_s / step_s)))
     if n % 2 == 0:
         n += 1                                            # MATLAB smooth uses an odd span
     kernel = np.ones(n)
-    sm = np.convolve(x, kernel, mode="same") / np.convolve(np.ones_like(x), kernel, mode="same")
-    return (sm - sm.min()) / (sm.max() - sm.min())
+    real = ~np.isnan(x)
+    sm = np.convolve(np.where(real, x, 0.0), kernel, mode="same") / np.convolve(real.astype(float), kernel, mode="same")
+    sm[~real] = np.nan
+    lo, hi = np.nanmin(sm), np.nanmax(sm)
+    return (sm - lo) / (hi - lo)
 
 
 def bimodal_thresh(x, startbins=12, maxbins=25):
@@ -77,7 +125,10 @@ def bimodal_thresh(x, startbins=12, maxbins=25):
     resolves two peaks, then the deepest trough between them; returns that bin centre, or NaN if no
     two-peak split is found. Peaks are taken on the zero-padded histogram (so edge bins can be modes),
     first two by location -- as in bz_BimodalThresh.m / the Motion branch. (The SW/theta inline copies
-    instead take the two tallest, findpeaks ...,'SortStr','descend'; kept simple here.)"""
+    instead take the two tallest, findpeaks ...,'SortStr','descend'; kept simple here.)
+
+    NaN (recording gaps) is dropped: np.histogram would otherwise fail on the implicit range."""
+    x = x[~np.isnan(x)]
     for numbins in range(startbins, maxbins + 1):
         hist, edges = np.histogram(x, bins=numbins)
         peaks, _ = signal.find_peaks(np.concatenate(([0], hist, [0])))
@@ -103,7 +154,10 @@ def kde_thresh(x, grid_n=512, min_prominence_frac=0.03, label=""):
     That is the honest answer for a unimodal metric -- and it is a real outcome here, not a corner
     case: several of the series x combo cases in docs/threshold_comparison.md, concentrated on
     ProbeA theta, which the dip test independently calls unimodal (p >= 0.99). NaN propagates:
-    comparisons against it are all-False, so classify() yields an empty mask rather than raising."""
+    comparisons against it are all-False, so classify() yields an empty mask rather than raising.
+
+    NaN (recording gaps) is dropped: gaussian_kde returns an all-NaN density otherwise."""
+    x = x[~np.isnan(x)]
     grid = np.linspace(x.min(), x.max(), grid_n)
     dens = gaussian_kde(x)(grid)
     peaks, props = signal.find_peaks(dens, prominence=min_prominence_frac * dens.max())
@@ -178,7 +232,8 @@ def select_theta_channel(rec, fs, convention, stride=16, manual_channel=None, **
     for ci in candidate_idx:
         trace = rec.get_traces(channel_ids=[rec.channel_ids[ci]]).squeeze()
         spec, freqs, _ = log_spectrogram(trace, fs, **spectrogram_kwargs)
-        dip_stats[ci] = diptest(np.log10(theta_ratio(spec, freqs, convention)))[0]
+        lr = np.log10(theta_ratio(spec, freqs, convention))   # 0/0 -> NaN in zero-power gap bins
+        dip_stats[ci] = diptest(lr[~np.isnan(lr)])[0]
     best = manual_channel if manual_channel is not None else int(np.nanargmax(dip_stats))
     return best, dip_stats, candidate_idx
 
@@ -203,7 +258,7 @@ def select_theta_channel_peak(rec, fs, theta=(5, 10), denom=(2, 20), stride=16, 
 
 def conditioned_theta_thresh(theta_metric, sw_metric, motion_metric, sw_thresh, motion_thresh,
                              startbins=12, maxbins=25, method="histogram", grid_n=512,
-                             conditioned=True, min_prominence_frac=0.03):
+                             conditioned=True, min_prominence_frac=0.03, exclude_mov=True):
     """Movement-conditioned theta threshold, buzcode ClusterStates_GetMetrics with one deviation:
     the trough is always taken on ~NREMtimes & ~MOVtimes, where buzcode takes it on ~MOVtimes and
     only excludes NREM as a fallback. MOVtimes = low SW & high motion. All inputs are the
@@ -217,14 +272,20 @@ def conditioned_theta_thresh(theta_metric, sw_metric, motion_metric, sw_thresh, 
     22 h). That subset is smaller, which is what the longer recording buys back.
 
     conditioned=False takes the trough on the full distribution instead; movtimes is returned either
-    way, since downstream plots and result.npz report it regardless of how the threshold was set."""
+    way, since downstream plots and result.npz report it regardless of how the threshold was set.
+
+    exclude_mov=False keeps the movement bins in the pool, i.e. the trough is taken on all non-NREM
+    bins. Those carry running theta, the strongest theta in the recording, so the trough can land
+    between quiet wake and run theta rather than on the REM/quiet-wake split this threshold exists
+    to place."""
     mov = (sw_metric < sw_thresh) & (motion_metric > motion_thresh)
     if not conditioned:
         return find_thresh(theta_metric, method, startbins, maxbins, grid_n,
                            min_prominence_frac, label="theta|all"), mov
-    keep = ~(sw_metric > sw_thresh) & ~mov
+    keep = ~(sw_metric > sw_thresh) & ~mov if exclude_mov else ~(sw_metric > sw_thresh)
+    label = "theta|~nrem&~mov" if exclude_mov else "theta|~nrem"
     return find_thresh(theta_metric[keep], method, startbins, maxbins, grid_n,
-                       min_prominence_frac, label="theta|~nrem&~mov"), mov
+                       min_prominence_frac, label=label), mov
 
 
 # --- Intracranial EMG proxy ---------------------------------------------------
