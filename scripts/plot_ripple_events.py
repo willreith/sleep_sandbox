@@ -2,6 +2,8 @@
 
 Usage: python plot_ripple_events.py --seg seg5-148 [--run-id-a HASH] [--run-id-b HASH]
                                     [--out-base data/derivatives]
+       python plot_ripple_events.py --events-dir .../ripples/{reference}/events/{run_id}/{chunk}
+                                    --out-dir .../ripples/{reference}/summary/{run_id}/{chunk}
 
 Reads both probes' events.npz plus the sleep-scoring result.npz and writes figures and a stats.yml
 into {out_base}/{seg}/ripples_summary/. Cross-probe by design: ProbeA is PFC and carries no ripple
@@ -9,6 +11,10 @@ field, so it is the empirical false-positive floor and is only informative drawn
 ProbeB -- it is plotted faint throughout, ProbeB solid. Because the product spans both probes it
 cannot live under either probe's run directory; sources.yml records which run_id each probe
 contributed. Defaults to the most recently created run per probe.
+
+--events-dir reads one run_ripples_chunked.py output instead: a single probe, its states from the
+scoring result named in events.yml, times on the absolute recording clock (times_abs). With no
+ProbeA there is no control, so the specificity block is left out.
 """
 
 import argparse
@@ -60,33 +66,54 @@ def nearest_lag(a, b):
 
 
 parser = argparse.ArgumentParser()
-parser.add_argument("--seg", required=True, help="preprocessed segment range, e.g. 'seg5-148'")
+parser.add_argument("--seg", help="preprocessed segment range, e.g. 'seg5-148'")
 parser.add_argument("--run-id-a", help="ProbeA run_id; default is its most recent run")
 parser.add_argument("--run-id-b", help="ProbeB run_id; default is its most recent run")
 parser.add_argument("--out-base", type=Path,
                     default=Path(__file__).resolve().parent.parent / "data" / "derivatives")
+parser.add_argument("--events-dir", type=Path, help="one chunk of a run_ripples_chunked.py run")
+parser.add_argument("--out-dir", type=Path, help="with --events-dir: where figures and stats go")
 args = parser.parse_args()
+assert (args.seg is None) != (args.events_dir is None), "give exactly one of --seg or --events-dir"
 
-out_dir = args.out_base / args.seg / "ripples_summary"
+E, META, RID, STATE, EVENTS_DIR = {}, {}, {}, {}, {}
+if args.events_dir:
+    out_dir = args.out_dir
+    meta = yaml.safe_load((args.events_dir / "events.yml").read_text())
+    PROBES = [meta["run_params"]["probe"]]
+    p = PROBES[0]
+    RID[p], E[p], META[p], EVENTS_DIR[p] = (meta["run_id"], dict(np.load(args.events_dir / "events.npz")),
+                                            meta, args.events_dir)
+    r = np.load(meta["sources"]["states"])
+    # nrem already excludes nodata; times_abs is the clock the chunked events are on
+    STATE[p] = {"times": r["times_abs"], "nrem": r["nrem"]}
+else:
+    out_dir = args.out_base / args.seg / "ripples_summary"
+    for probe, rid_arg in zip(PROBES, [args.run_id_a, args.run_id_b]):
+        RID[probe], E[probe], META[probe] = load_run(args.out_base, args.seg, probe, rid_arg)
+        EVENTS_DIR[probe] = args.out_base / args.seg / probe / "ripples" / "events" / RID[probe]
+        variant = META[probe]["run_params"]["variant"]
+        STATE[probe] = np.load(args.out_base / args.seg / probe / variant / "result.npz")
 out_dir.mkdir(parents=True, exist_ok=True)
-
-E, META, RID, STATE = {}, {}, {}, {}
-for probe, rid_arg in zip(PROBES, [args.run_id_a, args.run_id_b]):
-    RID[probe], E[probe], META[probe] = load_run(args.out_base, args.seg, probe, rid_arg)
-    variant = META[probe]["run_params"]["variant"]
-    STATE[probe] = np.load(args.out_base / args.seg / probe / variant / "result.npz")
-    print(f"{probe}: run {RID[probe]}, {E[probe]['start'].size} events", flush=True)
+for p in PROBES:
+    print(f"{p}: run {RID[p]}, {E[p]['start'].size} events", flush=True)
+REF = PROBES[-1]   # the probe whose run supplies band/detection parameters
 
 HAS_HZ = all("peak_hz" in E[p] for p in PROBES)
 HAS_PROM = all("prominence" in E[p] for p in PROBES)
-passband = META["ProbeB"]["run_params"]["band"]["passband"]
-det = META["ProbeB"]["run_params"]["detection"]
+passband = META[REF]["run_params"]["band"]["passband"]
+det = META[REF]["run_params"]["detection"]
+fs = float(E[REF]["peak"][-1] / E[REF]["peak_s"][-1])
+# Durations are whole samples, so the floor is the first sample count at/above min_duration_s (38
+# samples = 30.4 ms at 1250 Hz, not 30 ms); comparing seconds against 0.030 never matched.
+n_min_dur = np.ceil(det["min_duration_s"] * fs - 1e-6)
+n_max_dur = np.floor(det["max_duration_s"] * fs + 1e-6)
 shanks = {p: np.unique(E[p]["shank"]) for p in PROBES}
 # Separate colour families, not just separate alpha: sharing the tab10 cycle across probes makes
 # "orange" mean shank 1 on both, so a reader has to decode linestyle to know which probe they are
 # looking at. ProbeB takes the colours, the ProbeA control takes greys.
-colour = {"ProbeB": {int(s): f"C{i}" for i, s in enumerate(shanks["ProbeB"])},
-          "ProbeA": {int(s): str(0.25 + 0.15 * i) for i, s in enumerate(shanks["ProbeA"])}}
+colour = {"ProbeB": {int(s): f"C{i}" for i, s in enumerate(shanks.get("ProbeB", []))},
+          "ProbeA": {int(s): str(0.25 + 0.15 * i) for i, s in enumerate(shanks.get("ProbeA", []))}}
 SERIES = [(p, int(s)) for p in PROBES for s in shanks[p]]
 handles = [plt.Line2D([], [], color=colour[p][int(s)], label=f"{p} sh{int(s)}", **STYLE[p])
            for p in PROBES for s in shanks[p]]
@@ -169,7 +196,7 @@ ax = axes[2]
 for p in PROBES:
     t, nrem = STATE[p]["times"], STATE[p]["nrem"]
     dt = float(np.median(np.diff(t)))
-    hours = np.arange(0, t.max() / 3600 + 1)
+    hours = np.arange(np.floor(t.min() / 3600), t.max() / 3600 + 1)
     nrem_per_h = np.histogram(t[nrem] / 3600, hours)[0] * dt / 60
     for s, m in per_shank(p):
         cnt = np.histogram(E[p]["peak_s"][m] / 3600, hours)[0]
@@ -363,7 +390,7 @@ fig.savefig(out_dir / "corroboration.png", dpi=200)
 plt.close(fig)
 
 # ========================= figure 5: cross-shank =========================
-fig, axes = plt.subplots(1, 3, figsize=(15, 4.2))
+fig, axes = plt.subplots(1, len(PROBES) + 1, figsize=(5 * (len(PROBES) + 1), 4.2))
 for k, p in enumerate(PROBES):
     ax = axes[k]
     sh = shanks[p]
@@ -388,7 +415,7 @@ for k, p in enumerate(PROBES):
     ax.set_title(f"{p} — coincidence within {LAG_MS} ms", fontsize=9)
     fig.colorbar(im, ax=ax, fraction=0.046)
 
-ax = axes[2]
+ax = axes[-1]
 for p in PROBES:
     sh = shanks[p]
     for i, a in enumerate(sh):
@@ -423,13 +450,14 @@ for p in PROBES:
         d, z, c = E[p]["duration_s"][m], E[p]["peak_z"][m], E[p]["n_corroborating"][m]
         iei = np.diff(np.sort(E[p]["peak_s"][m]))
         hourly = np.histogram(E[p]["peak_s"][m] / 3600,
-                              np.arange(0, STATE[p]["times"].max() / 3600 + 1))[0]
+                              np.arange(np.floor(STATE[p]["times"].min() / 3600),
+                                        STATE[p]["times"].max() / 3600 + 1))[0]
         row = {
             "n": int(m.sum()),
             "rate_per_min_nrem": round(float(m.sum() / nrem_min), 4),
             "duration_ms_median": round(float(np.median(d) * 1000), 1),
-            "frac_at_min_duration": round(float(np.mean(d <= det["min_duration_s"] + 1e-9)), 3),
-            "frac_at_max_duration": round(float(np.mean(d >= det["max_duration_s"] - 1e-9)), 3),
+            "frac_at_min_duration": round(float(np.mean(np.round(d * fs) == n_min_dur)), 3),
+            "frac_at_max_duration": round(float(np.mean(np.round(d * fs) == n_max_dur)), 3),
             "peak_z_median": round(float(np.median(z)), 2),
             "peak_z_max": round(float(z.max()), 1),
             "amplitude_outlier_ratio": round(float(z.max() / np.median(z)), 2),
@@ -451,20 +479,21 @@ for p in PROBES:
         block["shanks"][s] = row
     stats["per_probe"][p] = block
 
-best_b = max(stats["per_probe"]["ProbeB"]["shanks"].values(), key=lambda r: r["rate_per_min_nrem"])
-worst_a = max(stats["per_probe"]["ProbeA"]["shanks"].values(), key=lambda r: r["rate_per_min_nrem"])
-stats["specificity"] = {
-    "note": "ProbeA is PFC and should carry no ripples, so its rate is an empirical false-positive "
-            "floor for the current parameters.",
-    "probeB_best_shank_rate": best_b["rate_per_min_nrem"],
-    "probeA_worst_shank_rate": worst_a["rate_per_min_nrem"],
-    "ratio": round(best_b["rate_per_min_nrem"] / worst_a["rate_per_min_nrem"], 2),
-}
+if {"ProbeA", "ProbeB"} <= set(PROBES):
+    best_b = max(stats["per_probe"]["ProbeB"]["shanks"].values(), key=lambda r: r["rate_per_min_nrem"])
+    worst_a = max(stats["per_probe"]["ProbeA"]["shanks"].values(), key=lambda r: r["rate_per_min_nrem"])
+    stats["specificity"] = {
+        "note": "ProbeA is PFC and should carry no ripples, so its rate is an empirical false-positive "
+                "floor for the current parameters.",
+        "probeB_best_shank_rate": best_b["rate_per_min_nrem"],
+        "probeA_worst_shank_rate": worst_a["rate_per_min_nrem"],
+        "ratio": round(best_b["rate_per_min_nrem"] / worst_a["rate_per_min_nrem"], 2),
+    }
 with open(out_dir / "stats.yml", "w") as f:
     yaml.safe_dump(stats, f, sort_keys=False)
 with open(out_dir / "sources.yml", "w") as f:
-    yaml.safe_dump({p: {"run_id": RID[p],
-                        "events": str(args.out_base / args.seg / p / "ripples" / "events" / RID[p])}
-                    for p in PROBES}, f, sort_keys=False)
+    yaml.safe_dump({p: {"run_id": RID[p], "events": str(EVENTS_DIR[p])} for p in PROBES},
+                   f, sort_keys=False)
 print(f"\nsaved -> {out_dir}", flush=True)
-print(yaml.safe_dump(stats["specificity"], sort_keys=False))
+if "specificity" in stats:
+    print(yaml.safe_dump(stats["specificity"], sort_keys=False))
