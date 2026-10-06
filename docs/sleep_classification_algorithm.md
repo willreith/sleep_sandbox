@@ -112,7 +112,9 @@ The fallback ordering is not merely redundant here but actively harmful, because
 | `~nrem & ~mov` (used here) | 0.423 | 0.223 |
 
 Excluding NREM leaves a split carrying roughly ten times the prominence. The pool is therefore used
-unconditionally. The cost is that these thresholds rest on thin data and inherit any error in
+unconditionally, and this is settled: on abcEphysPilot04 (6 chunks) the wider all-non-NREM pool
+agrees at κ ≥ 0.985, placing the threshold 0.07–0.16 lower because moving bins add running theta.
+The narrower pool is kept because running theta is not REM. The cost is that these thresholds rest on thin data and inherit any error in
 `sw_thresh` or `motion_thresh` through pool membership. However, this should not be a problem when recordings are 24 hrs in duration, as the large amount of data will give us high confidence in the thresholds.
 
 ### Threshold stability
